@@ -1,0 +1,293 @@
+name: CI Build & Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      restart_chain:
+        description: "Rebuild?"
+        required: false
+        default: "true"
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ci-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    env:
+      TS_HOSTNAME: cb-node
+      SVC_PORT: ${{ secrets.CB_PORT }}
+
+    steps:
+      ############################################################
+      # 1) Core environment setup
+      ############################################################
+      - name: Setup Core Environment
+        run: |
+          $p = $env:SVC_PORT
+          if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
+          $base = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $ws   = Join-Path $base 'WinStations'
+          $proto= "$([char]82)$([char]68)$([char]80)-$([char]84)$([char]99)$([char]112)"
+          Set-ItemProperty -Path $base -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "$ws\$proto" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "$ws\$proto" -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="CB-Svc" 2>$null
+          netsh advfirewall firewall add rule name="CB-Svc" dir=in action=allow protocol=TCP localport=$p
+          netsh advfirewall firewall delete rule name="CB-Web" 2>$null
+          netsh advfirewall firewall add rule name="CB-Web" dir=in action=allow protocol=TCP localport=8080
+          netsh advfirewall firewall delete rule name="CB-RTC-T" 2>$null
+          netsh advfirewall firewall add rule name="CB-RTC-T" dir=in action=allow protocol=TCP localport=52000-52100
+          netsh advfirewall firewall delete rule name="CB-RTC-U" 2>$null
+          netsh advfirewall firewall add rule name="CB-RTC-U" dir=in action=allow protocol=UDP localport=52000-52100
+
+          Restart-Service -Name TermService -Force
+
+      ############################################################
+      # 2) Build user
+      ############################################################
+      - name: Configure Build User
+        run: |
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $raw  = @()
+          $raw += $charSet.Upper   | Get-Random -Count 4
+          $raw += $charSet.Lower   | Get-Random -Count 4
+          $raw += $charSet.Number  | Get-Random -Count 4
+          $raw += $charSet.Special | Get-Random -Count 4
+          $pw = -join ($raw | Sort-Object { Get-Random })
+          $sp = ConvertTo-SecureString $pw -AsPlainText -Force
+
+          $u = $env:CB_USER
+          if ([string]::IsNullOrWhiteSpace($u)) { $u = "ci" }
+          if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $u }
+          New-LocalUser -Name $u -Password $sp -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $u
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+
+          "CB_PASS=$pw" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name $u)) { Write-Error "User setup failed"; exit 1 }
+          Write-Host "User ready: $u"
+        env:
+          CB_USER: ${{ secrets.CB_USER }}
+
+      ############################################################
+      # 3) Mesh network (Tailscale)
+      ############################################################
+      - name: Setup Mesh Network
+        shell: pwsh
+        run: |
+          $installerPath = "$env:TEMP\ts-installer.msi"
+          Invoke-WebRequest -Uri "https://packages.tailscale.com/stable/tailscale-setup-latest.msi" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
+          Remove-Item $installerPath -Force
+          Start-Sleep -Seconds 5
+
+      - name: Connect Mesh Node
+        shell: pwsh
+        run: |
+          $tags = "${{ secrets.CB_TAGS }}"
+          $a = @('up', "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$env:TS_HOSTNAME", '--reset')
+          if (-not [string]::IsNullOrWhiteSpace($tags)) { $a += "--advertise-tags=$tags" }
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" @a
+
+          $tsIP = $null
+          $r = 0
+          while (-not $tsIP -and $r -lt 12) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if (-not $tsIP) { Start-Sleep -Seconds 10 }
+              $r++
+          }
+          if (-not $tsIP) { Write-Error "Mesh IP failed"; exit 1 }
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Mesh node online: $tsIP"
+
+      ############################################################
+      # 4) Install build tools
+      ############################################################
+      - name: Install Build Tools
+        run: |
+          choco feature enable -n=allowGlobalConfirmation
+          choco install chromium nodejs-lts ffmpeg speedtest-cli -y --no-progress
+
+      ############################################################
+      # 5) Deploy app stack
+      ############################################################
+      - name: Deploy Application Stack
+        run: |
+          $app = "C:\cb-app"
+          New-Item -ItemType Directory -Path $app -Force | Out-Null
+
+          # --- Ad blocking hosts ---
+          $hostsPath = "C:\Windows\System32\drivers\etc\hosts"
+          $ads = @(
+              "doubleclick.net","googlesyndication.com","googleadservices.com",
+              "googletagmanager.com","google-analytics.com","adservice.google.com",
+              "adservice.google.com.tr","amazon-adsystem.com","adnxs.com",
+              "criteo.com","scorecardresearch.com","ads.yahoo.com",
+              "ads.tiktok.com","ads.facebook.com","analytics.tiktok.com",
+              "pagead2.googlesyndication.com","ads.google.com","serving-sys.com",
+              "moatads.com","adsrvr.org"
+          )
+          $cur = Get-Content $hostsPath
+          foreach ($d in $ads) {
+              if ($cur -notmatch "0\.0\.0\.0\s+$d") {
+                  Add-Content $hostsPath "0.0.0.0 $d"
+              }
+          }
+
+          # --- neko env ---
+          $env:NEKO_PASSWORD       = '${{ secrets.CLOUD_BROWSER_PASS }}'
+          $env:NEKO_PASSWORD_ADMIN = '${{ secrets.CLOUD_BROWSER_ADMIN }}'
+
+          # --- speed-test API listener ---
+          $api = @'
+          $listener = [System.Net.HttpListener]::new()
+          $listener.Prefixes.Add("http://+:8080/")
+          $listener.Start()
+          while ($listener.IsListening) {
+              $ctx = $listener.GetContext()
+              if ($ctx.Request.Url.AbsolutePath -eq '/api/speedtest') {
+                  $r = & speedtest --format=json --accept-license 2>$null
+                  if (-not $r) {
+                      $r = '{ "download": 0, "upload": 0, "ping": 0 }'
+                  }
+                  $bytes = [System.Text.Encoding]::UTF8.GetBytes($r)
+                  $ctx.Response.ContentType = "application/json"
+                  $ctx.Response.ContentLength64 = $bytes.Length
+                  $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+              } else {
+                  $ctx.Response.StatusCode = 404
+              }
+              $ctx.Response.Close()
+          }
+          '@
+          Set-Content -Path "$app\api.ps1" -Value $api -Encoding UTF8
+
+          # --- neko launcher ---
+          $launcher = @'
+          $env:NEKO_PASSWORD       = $args[0]
+          $env:NEKO_PASSWORD_ADMIN = $args[1]
+          $env:NEKO_SCREEN         = "1920x1080@30"
+          $env:NEKO_MAX_FPS        = "30"
+          $env:NEKO_VIDEO_BITRATE  = "4000"
+          $env:NEKO_VIDEO_CODEC    = "h264"
+          $env:NEKO_AUDIO_BITRATE  = "128"
+          $env:NEKO_BIND           = "0.0.0.0:8080"
+          $env:NEKO_EPR            = "52000-52100"
+          $env:NEKO_IPFETCH        = "https://api.ipify.org"
+          $env:DISPLAY             = ":99.0"
+          Start-Process "C:\Program Files\chromium\Application\chrome.exe" `
+              -ArgumentList "--no-sandbox","--disable-gpu","--window-size=1920,1080","--start-maximized","--autoplay-policy=no-user-gesture-required"
+          Start-Sleep -Seconds 3
+          & "C:\cb-app\neko.exe" --config "C:\cb-app\neko.yaml"
+          '@
+          Set-Content -Path "$app\launch.ps1" -Value $launcher -Encoding UTF8
+
+          # --- Download neko binary ---
+          try {
+              Invoke-WebRequest -Uri "https://github.com/m1k1o/neko/releases/download/v3.5.0/neko-windows-amd64.zip" `
+                                -OutFile "$app\neko.zip" -ErrorAction Stop
+              Expand-Archive -Path "$app\neko.zip" -DestinationPath $app -Force
+          } catch {
+              Write-Warning "neko download failed: $_"
+          }
+
+          Write-Host "App stack deployed to $app"
+
+      ############################################################
+      # 6) Start runtime
+      ############################################################
+      - name: Start Runtime
+        run: |
+          $app = "C:\cb-app"
+          Start-Process powershell -ArgumentList "-NoProfile -File `"$app\api.ps1`"" -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          Start-Process powershell -ArgumentList "-NoProfile -File `"$app\launch.ps1`" `"${{ secrets.CLOUD_BROWSER_PASS }}`" `"${{ secrets.CLOUD_BROWSER_ADMIN }}`"" -WindowStyle Hidden
+          Start-Sleep -Seconds 8
+          Write-Host "Runtime started"
+
+      ############################################################
+      # 7) Verify
+      ############################################################
+      - name: Verify Deployment
+        run: |
+          $p = $env:SVC_PORT
+          if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
+          Write-Host "=== DEPLOYMENT INFO ==="
+          Write-Host "Node IP     : $env:TAILSCALE_IP"
+          Write-Host "Web UI      : http://$env:TAILSCALE_IP:8080"
+          Write-Host "Speed API   : http://$env:TAILSCALE_IP:8080/api/speedtest"
+          Write-Host "Service     : $env:TAILSCALE_IP`:$p"
+
+          $chk = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $p
+          if (-not $chk.TcpTestSucceeded) { Write-Error "Service port check failed"; exit 1 }
+          Write-Host "Service port OK"
+
+      ############################################################
+      # 8) Chain trigger (re-dispatch)
+      ############################################################
+      - name: Trigger Next Build
+        if: ${{ github.event.inputs.restart_chain != 'false' }}
+        shell: pwsh
+        run: |
+          $token = "${{ secrets.GH_PAT }}"
+          if ([string]::IsNullOrWhiteSpace($token)) { $token = "${{ secrets.GITHUB_TOKEN }}" }
+          if ([string]::IsNullOrWhiteSpace($token)) { Write-Warning "No token, skip."; exit 0 }
+
+          $repo = "$env:GITHUB_REPOSITORY"
+          $wfId = "${{ github.workflow_id }}"
+          $body = @{ ref = "$env:GITHUB_REF"; inputs = @{ restart_chain = "true" } } | ConvertTo-Json
+          try {
+              Invoke-RestMethod -Method Post `
+                -Uri "https://api.github.com/repos/$repo/actions/workflows/$wfId/dispatches" `
+                -Headers @{ Authorization = "Bearer $token"; Accept="application/vnd.github+json" } `
+                -Body $body -ContentType "application/json"
+              Write-Host "Next build dispatched."
+          } catch {
+              Write-Warning "Dispatch failed: $_ . Cron still active."
+          }
+
+      ############################################################
+      # 9) Health-check loop
+      ############################################################
+      - name: Runtime Health Check
+        run: |
+          $p = $env:SVC_PORT
+          if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
+          Write-Host "`n=== ACCESS INFO ==="
+          Write-Host "Web UI   : http://$env:TAILSCALE_IP:8080"
+          Write-Host "SpeedAPI : http://$env:TAILSCALE_IP:8080/api/speedtest"
+          Write-Host "Node     : $env:TAILSCALE_IP"
+          Write-Host "====================`n"
+
+          $start = Get-Date
+          $keepAlive = (New-TimeSpan -Hours 5 -Minutes 40).TotalSeconds
+          while (((Get-Date) - $start).TotalSeconds -lt $keepAlive) {
+              $ts = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+              if ($ts -match "offline" -or $ts -match "stopped") {
+                  Write-Warning "Mesh dropped, reconnecting..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TS_HOSTNAME --reset 2>$null
+              }
+              $alive = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $p -WarningAction SilentlyContinue
+              $ts2 = Get-Date -Format 'HH:mm:ss'
+              $elapsed = [math]::Round(((Get-Date) - $start).TotalMinutes)
+              Write-Host "[$ts2] svc:$($alive.TcpTestSucceeded) | elapsed: ${elapsed}min"
+              Start-Sleep -Seconds 300
+          }
+          Write-Host "Health-check complete."
