@@ -92,24 +92,100 @@ jobs:
       - name: Setup Mesh Network
         shell: pwsh
         run: |
+          # Flush DNS in case of stale cache
+          ipconfig /flushdns | Out-Null
+
           $installerPath = "$env:TEMP\ts-installer.msi"
-          Invoke-WebRequest -Uri "https://packages.tailscale.com/stable/tailscale-setup-latest.msi" -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $downloaded = $false
+
+          # Multiple URLs in case one fails (CDN / DNS issues)
+          $urls = @(
+            "https://packages.tailscale.com/stable/tailscale-setup-latest.msi",
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi",
+            "https://download.tailscale.com/stable/tailscale-setup-latest.msi"
+          )
+
+          foreach ($url in $urls) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Write-Host "Trying $url (attempt $attempt)..."
+                $ProgressPreference = 'SilentlyContinue'
+                Invoke-WebRequest -Uri $url -OutFile $installerPath -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+                if ((Test-Path $installerPath) -and (Get-Item $installerPath).Length -gt 100KB) {
+                  Write-Host "Downloaded OK from $url ($(((Get-Item $installerPath).Length)/1MB) MB)"
+                  $downloaded = $true
+                  break
+                }
+              } catch {
+                Write-Host "Failed attempt $attempt : $($_.Exception.Message)"
+                Start-Sleep -Seconds 5
+                ipconfig /flushdns | Out-Null
+              }
+            }
+            if ($downloaded) { break }
+          }
+
+          # Fallback: choco install tailscale
+          if (-not $downloaded) {
+            Write-Host "Direct download failed, trying choco..."
+            choco install tailscale -y --no-progress 2>&1 | Out-Null
+            if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              $downloaded = $true
+              Write-Host "Choco install OK"
+            }
+          }
+
+          if (-not $downloaded) {
+            # Last resort: winget
+            Write-Host "Trying winget..."
+            winget install tailscale.1 --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+            if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              $downloaded = $true
+            }
+          }
+
+          if (-not $downloaded) { Write-Error "All download methods failed"; exit 1 }
+
+          # Install MSI if we downloaded it (choco/winget already installed)
+          if (Test-Path $installerPath) {
+            Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
+            Remove-Item $installerPath -Force
+          }
           Start-Sleep -Seconds 5
 
       - name: Connect Mesh Node
         shell: pwsh
         run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+            # Sometimes installed to x86 path
+            $tsExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+          }
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "tailscale.exe not found"; exit 1
+          }
+          Write-Host "Using: $tsExe"
+
           $tags = "${{ secrets.CB_TAGS }}"
-          $a = @('up', "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$env:TS_HOSTNAME", '--reset')
-          if (-not [string]::IsNullOrWhiteSpace($tags)) { $a += "--advertise-tags=$tags" }
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" @a
+          $connected = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+              $a = @('up', "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$env:TS_HOSTNAME", '--reset')
+              if (-not [string]::IsNullOrWhiteSpace($tags)) { $a += "--advertise-tags=$tags" }
+              & $tsExe @a 2>&1 | ForEach-Object { Write-Host $_ }
+              $connected = $true
+              break
+            } catch {
+              Write-Host "Connect attempt $attempt failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds 10
+            }
+          }
+          if (-not $connected) { Write-Error "Mesh connect failed after 5 attempts"; exit 1 }
 
           $tsIP = $null
           $r = 0
-          while (-not $tsIP -and $r -lt 12) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          while (-not $tsIP -and $r -lt 15) {
+              $tsIP = & $tsExe ip -4 2>$null
               if (-not $tsIP) { Start-Sleep -Seconds 10 }
               $r++
           }
@@ -270,6 +346,8 @@ jobs:
         run: |
           $p = $env:SVC_PORT
           if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) { $tsExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
           Write-Host "`n=== ACCESS INFO ==="
           Write-Host "Web UI   : http://$env:TAILSCALE_IP:8080"
           Write-Host "SpeedAPI : http://$env:TAILSCALE_IP:8080/api/speedtest"
@@ -279,10 +357,10 @@ jobs:
           $start = Get-Date
           $keepAlive = (New-TimeSpan -Hours 5 -Minutes 40).TotalSeconds
           while (((Get-Date) - $start).TotalSeconds -lt $keepAlive) {
-              $ts = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+              $ts = & $tsExe status 2>$null
               if ($ts -match "offline" -or $ts -match "stopped") {
                   Write-Warning "Mesh dropped, reconnecting..."
-                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TS_HOSTNAME --reset 2>$null
+                  & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TS_HOSTNAME --reset 2>$null
               }
               $alive = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $p -WarningAction SilentlyContinue
               $ts2 = Get-Date -Format 'HH:mm:ss'
