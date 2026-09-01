@@ -199,7 +199,41 @@ jobs:
       - name: Install Build Tools
         run: |
           choco feature enable -n=allowGlobalConfirmation
-          choco install chromium nodejs-lts ffmpeg speedtest-cli -y --no-progress
+          # Install packages one by one so one failure doesn't kill the build
+          choco install chromium -y --no-progress
+          choco install nodejs-lts -y --no-progress
+          choco install ffmpeg -y --no-progress
+          # speedtest-cli doesn't exist in choco anymore; install Ookla official CLI
+          $stPath = "C:\cb-app\speedtest.exe"
+          New-Item -ItemType Directory -Path "C:\cb-app" -Force | Out-Null
+          $stOk = $false
+          $stUrls = @(
+            "https://install.speedtest.net/app/cli/speedtest-cli.exe",
+            "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-win64.zip"
+          )
+          foreach ($u in $stUrls) {
+            try {
+              $ProgressPreference = 'SilentlyContinue'
+              if ($u -match '\.zip$') {
+                $zip = "$env:TEMP\st.zip"
+                Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing -TimeoutSec 60
+                Expand-Archive -Path $zip -DestinationPath "C:\cb-app" -Force
+                Remove-Item $zip -Force
+              } else {
+                Invoke-WebRequest -Uri $u -OutFile $stPath -UseBasicParsing -TimeoutSec 60
+              }
+              $exe = Get-ChildItem "C:\cb-app" -Filter "speedtest*.exe" -Recurse | Select-Object -First 1
+              if ($exe) { $stOk = $true; Write-Host "Speedtest CLI installed: $($exe.FullName)"; break }
+            } catch { Write-Host "Speedtest download failed from $u : $($_.Exception.Message)" }
+          }
+          if (-not $stOk) {
+            Write-Host "Trying choco fallback for speedtest..."
+            choco install speedtest-by-ookla -y --no-progress 2>&1 | Out-Null
+          }
+          # Refresh PATH so node/npm are available
+          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+          refreshenv 2>$null
+          Write-Host "Build tools installed"
 
       ############################################################
       # 5) Deploy app stack
@@ -236,10 +270,22 @@ jobs:
           $listener = [System.Net.HttpListener]::new()
           $listener.Prefixes.Add("http://+:8080/")
           $listener.Start()
+          # Find speedtest exe
+          $stExe = $null
+          $candidates = @(
+            "C:\cb-app\speedtest.exe",
+            "C:\cb-app\speedtest-cli.exe"
+          )
+          foreach ($c in $candidates) { if (Test-Path $c) { $stExe = $c; break } }
+          if (-not $stExe) {
+            $found = Get-ChildItem "C:\cb-app" -Filter "speedtest*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $stExe = $found.FullName }
+          }
+          if (-not $stExe) { $stExe = "speedtest" } # fallback to PATH
           while ($listener.IsListening) {
               $ctx = $listener.GetContext()
               if ($ctx.Request.Url.AbsolutePath -eq '/api/speedtest') {
-                  $r = & speedtest --format=json --accept-license 2>$null
+                  $r = & $stExe --format=json --accept-license --accept-gdpr 2>$null
                   if (-not $r) {
                       $r = '{ "download": 0, "upload": 0, "ping": 0 }'
                   }
@@ -275,14 +321,33 @@ jobs:
           '@
           Set-Content -Path "$app\launch.ps1" -Value $launcher -Encoding UTF8
 
-          # --- Download neko binary ---
-          try {
-              Invoke-WebRequest -Uri "https://github.com/m1k1o/neko/releases/download/v3.5.0/neko-windows-amd64.zip" `
-                                -OutFile "$app\neko.zip" -ErrorAction Stop
-              Expand-Archive -Path "$app\neko.zip" -DestinationPath $app -Force
-          } catch {
-              Write-Warning "neko download failed: $_"
+          # --- Download neko binary (with retry) ---
+          $nekoUrls = @(
+            "https://github.com/m1k1o/neko/releases/download/v3.5.0/neko-windows-amd64.zip",
+            "https://gh-proxy.com/https://github.com/m1k1o/neko/releases/download/v3.5.0/neko-windows-amd64.zip"
+          )
+          $nekoOk = $false
+          $ProgressPreference = 'SilentlyContinue'
+          foreach ($nUrl in $nekoUrls) {
+            for ($na = 1; $na -le 3; $na++) {
+              try {
+                Write-Host "Downloading neko from $nUrl (attempt $na)..."
+                Invoke-WebRequest -Uri $nUrl -OutFile "$app\neko.zip" -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+                if ((Test-Path "$app\neko.zip") -and (Get-Item "$app\neko.zip").Length -gt 1MB) {
+                  Expand-Archive -Path "$app\neko.zip" -DestinationPath $app -Force
+                  $nekoOk = $true
+                  Write-Host "neko downloaded OK"
+                  break
+                }
+              } catch {
+                Write-Host "neko attempt $na failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds 5
+              }
+            }
+            if ($nekoOk) { break }
           }
+          if (-not $nekoOk) { Write-Warning "neko download failed after all retries" }
+          Remove-Item "$app\neko.zip" -ErrorAction SilentlyContinue
 
           Write-Host "App stack deployed to $app"
 
