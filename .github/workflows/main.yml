@@ -270,6 +270,21 @@ jobs:
           # --- Screego env ---
           $screegoPass = '${{ secrets.CLOUD_BROWSER_PASS }}'
 
+          # --- Fetch Tailscale IP (needed for SCREEGO_EXTERNAL_IP) ---
+          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) { $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source }
+          $tsIP = $env:TAILSCALE_IP
+          if ([string]::IsNullOrWhiteSpace($tsIP) -and $tsExe) { $tsIP = & $tsExe ip -4 2>$null }
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            $ipFile = "$app\node-ip.txt"
+            if (Test-Path $ipFile) { $tsIP = (Get-Content $ipFile -Raw).Trim() }
+          }
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            Write-Warning "Could not determine Tailscale IP, using 127.0.0.1 as fallback"
+            $tsIP = "127.0.0.1"
+          }
+          Write-Host "Tailscale IP for Screego: $tsIP"
+
           # --- speed-test API listener (port 8080) ---
           $api = @'
           $listener = [System.Net.HttpListener]::new()
@@ -307,8 +322,11 @@ jobs:
           Set-Content -Path "$app\api.ps1" -Value $api -Encoding UTF8
 
           # --- Screego config file ---
+          # NOTE: SCREEGO_EXTERNAL_IP is REQUIRED — without it Screego does a
+          # fatal exit immediately. We set it to the Tailscale IP.
           $cfg = @"
           SCREEGO_SECRET=$screegoPass
+          SCREEGO_EXTERNAL_IP=$tsIP
           SCREEGO_SERVER_TLS=false
           SCREEGO_SERVER_ADDRESS=0.0.0.0:5050
           SCREEGO_TURN_ADDRESS=0.0.0.0:3478
@@ -332,9 +350,10 @@ jobs:
           $screegoUrl = "http://$tsIP`:5050"
           Write-Host "Screego URL: $screegoUrl"
 
-          # Start Screego server
-          Start-Process "$app\screego.exe" -ArgumentList "--config","$app\screego.config" -WindowStyle Hidden
-          Start-Sleep -Seconds 3
+          # Start Screego server (must use 'serve' subcommand; config file is
+          # auto-discovered as screego.config in the same directory as the exe)
+          Start-Process "$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -RedirectStandardOutput "$app\screego-stdout.log" -RedirectStandardError "$app\screego-stderr.log"
+          Start-Sleep -Seconds 5
 
           # Wait for Screego to be reachable
           $ready = $false
@@ -344,7 +363,17 @@ jobs:
               if ($r.StatusCode -eq 200) { $ready = $true; break }
             } catch { Start-Sleep -Seconds 2 }
           }
-          if (-not $ready) { Write-Warning "Screego not responding on 5050, continuing anyway" }
+          if (-not $ready) {
+            Write-Warning "Screego not responding on 5050"
+            if (Test-Path "$app\screego-stderr.log") {
+              Write-Host "=== Screego stderr ==="
+              Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
+            }
+            if (Test-Path "$app\screego-stdout.log") {
+              Write-Host "=== Screego stdout ==="
+              Get-Content "$app\screego-stdout.log" | ForEach-Object { Write-Host $_ }
+            }
+          }
 
           # Launch Chromium with auto screen capture
           $chromeArgs = @(
@@ -521,8 +550,23 @@ jobs:
                 Write-Warning "Screego down, restarting..."
                 $proc = Get-Process -Name "screego" -ErrorAction SilentlyContinue
                 if ($proc) { $proc | Stop-Process -Force }
-                Start-Process "C:\cb-app\screego.exe" -ArgumentList "--config","C:\cb-app\screego.config" -WindowStyle Hidden
-                Start-Sleep -Seconds 5
+                Start-Sleep -Seconds 2
+                # Re-write config with latest IP (IP may have changed after mesh reconnect)
+                $newCfg = @"
+                SCREEGO_SECRET=${{ secrets.CLOUD_BROWSER_PASS }}
+                SCREEGO_EXTERNAL_IP=$tsIP
+                SCREEGO_SERVER_TLS=false
+                SCREEGO_SERVER_ADDRESS=0.0.0.0:5050
+                SCREEGO_TURN_ADDRESS=0.0.0.0:3478
+                SCREEGO_TURN_PORT_RANGE=50000:50100
+                SCREEGO_AUTH_MODE=none
+                SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false
+                SCREEGO_LOG_LEVEL=info
+                SCREEGO_SESSION_TIMEOUT_SECONDS=86400
+                "@
+                Set-Content -Path "C:\cb-app\screego.config" -Value $newCfg -Encoding UTF8
+                Start-Process "C:\cb-app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden
+                Start-Sleep -Seconds 8
               }
 
               Start-Sleep -Seconds 300
