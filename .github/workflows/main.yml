@@ -286,111 +286,110 @@ jobs:
           Write-Host "Tailscale IP for Screego: $tsIP"
 
           # --- speed-test API listener (port 8080) ---
-          $api = @'
-          $listener = [System.Net.HttpListener]::new()
-          $listener.Prefixes.Add("http://+:8080/")
-          $listener.Start()
-          # Find speedtest exe
-          $stExe = $null
-          $candidates = @(
-            "C:\cb-app\speedtest.exe",
-            "C:\cb-app\speedtest-cli.exe"
+          # Written line-by-line to avoid PowerShell here-string indentation issues
+          $apiLines = @(
+            '`$listener = [System.Net.HttpListener]::new()',
+            '`$listener.Prefixes.Add("http://+:8080/")',
+            '`$listener.Start()',
+            '# Find speedtest exe',
+            '`$stExe = `$null',
+            '`$candidates = @("C:\cb-app\speedtest.exe","C:\cb-app\speedtest-cli.exe")',
+            'foreach (`$c in `$candidates) { if (Test-Path `$c) { `$stExe = `$c; break } }',
+            'if (-not `$stExe) {',
+            '  `$found = Get-ChildItem "C:\cb-app" -Filter "speedtest*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1',
+            '  if (`$found) { `$stExe = `$found.FullName }',
+            '}',
+            'if (-not `$stExe) { `$stExe = "speedtest" }',
+            'while (`$listener.IsListening) {',
+            '  `$ctx = `$listener.GetContext()',
+            '  if (`$ctx.Request.Url.AbsolutePath -eq ''/api/speedtest'') {',
+            '    `$r = & `$stExe --format=json --accept-license --accept-gdpr 2>`$null',
+            '    if (-not `$r) { `$r = ''{ "download": 0, "upload": 0, "ping": 0 }'' }',
+            '    `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$r)',
+            '    `$ctx.Response.ContentType = "application/json"',
+            '    `$ctx.Response.ContentLength64 = `$bytes.Length',
+            '    `$ctx.Response.OutputStream.Write(`$bytes, 0, `$bytes.Length)',
+            '  } else {',
+            '    `$ctx.Response.StatusCode = 404',
+            '  }',
+            '  `$ctx.Response.Close()',
+            '}'
           )
-          foreach ($c in $candidates) { if (Test-Path $c) { $stExe = $c; break } }
-          if (-not $stExe) {
-            $found = Get-ChildItem "C:\cb-app" -Filter "speedtest*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $stExe = $found.FullName }
-          }
-          if (-not $stExe) { $stExe = "speedtest" }
-          while ($listener.IsListening) {
-              $ctx = $listener.GetContext()
-              if ($ctx.Request.Url.AbsolutePath -eq '/api/speedtest') {
-                  $r = & $stExe --format=json --accept-license --accept-gdpr 2>$null
-                  if (-not $r) {
-                      $r = '{ "download": 0, "upload": 0, "ping": 0 }'
-                  }
-                  $bytes = [System.Text.Encoding]::UTF8.GetBytes($r)
-                  $ctx.Response.ContentType = "application/json"
-                  $ctx.Response.ContentLength64 = $bytes.Length
-                  $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-              } else {
-                  $ctx.Response.StatusCode = 404
-              }
-              $ctx.Response.Close()
-          }
-          '@
-          Set-Content -Path "$app\api.ps1" -Value $api -Encoding UTF8
+          Set-Content -Path "$app\api.ps1" -Value $apiLines -Encoding UTF8
 
           # --- Screego config file ---
           # NOTE: SCREEGO_EXTERNAL_IP is REQUIRED — without it Screego does a
           # fatal exit immediately. We set it to the Tailscale IP.
-          $cfg = @"
-          SCREEGO_SECRET=$screegoPass
-          SCREEGO_EXTERNAL_IP=$tsIP
-          SCREEGO_SERVER_TLS=false
-          SCREEGO_SERVER_ADDRESS=0.0.0.0:5050
-          SCREEGO_TURN_ADDRESS=0.0.0.0:3478
-          SCREEGO_TURN_PORT_RANGE=50000:50100
-          SCREEGO_AUTH_MODE=none
-          SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false
-          SCREEGO_LOG_LEVEL=info
-          SCREEGO_SESSION_TIMEOUT_SECONDS=86400
-          "@
-          Set-Content -Path "$app\screego.config" -Value $cfg -Encoding UTF8
+          # Using array-of-lines + Set-Content to avoid PowerShell here-string
+          # indentation issues (closing "@ must be at column 0).
+          $cfgLines = @(
+            "SCREEGO_SECRET=$screegoPass",
+            "SCREEGO_EXTERNAL_IP=$tsIP",
+            "SCREEGO_SERVER_TLS=false",
+            "SCREEGO_SERVER_ADDRESS=0.0.0.0:5050",
+            "SCREEGO_TURN_ADDRESS=0.0.0.0:3478",
+            "SCREEGO_TURN_PORT_RANGE=50000:50100",
+            "SCREEGO_AUTH_MODE=none",
+            "SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false",
+            "SCREEGO_LOG_LEVEL=info",
+            "SCREEGO_SESSION_TIMEOUT_SECONDS=86400"
+          )
+          Set-Content -Path "$app\screego.config" -Value $cfgLines -Encoding UTF8
 
           # --- Chromium auto-screen-share launcher ---
           # Opens Screego web UI, auto-creates a room, auto-shares the desktop screen
-          $launcher = @'
-          $app = "C:\cb-app"
-          $tsIP = $env:TAILSCALE_IP
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-            $ipFile = "$app\node-ip.txt"
-            if (Test-Path $ipFile) { $tsIP = (Get-Content $ipFile -Raw).Trim() }
-          }
-          $screegoUrl = "http://$tsIP`:5050"
-          Write-Host "Screego URL: $screegoUrl"
-
-          # Start Screego server (must use 'serve' subcommand; config file is
-          # auto-discovered as screego.config in the same directory as the exe)
-          Start-Process "$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -RedirectStandardOutput "$app\screego-stdout.log" -RedirectStandardError "$app\screego-stderr.log"
-          Start-Sleep -Seconds 5
-
-          # Wait for Screego to be reachable
-          $ready = $false
-          for ($i = 1; $i -le 10; $i++) {
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-              if ($r.StatusCode -eq 200) { $ready = $true; break }
-            } catch { Start-Sleep -Seconds 2 }
-          }
-          if (-not $ready) {
-            Write-Warning "Screego not responding on 5050"
-            if (Test-Path "$app\screego-stderr.log") {
-              Write-Host "=== Screego stderr ==="
-              Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
-            }
-            if (Test-Path "$app\screego-stdout.log") {
-              Write-Host "=== Screego stdout ==="
-              Get-Content "$app\screego-stdout.log" | ForEach-Object { Write-Host $_ }
-            }
-          }
-
-          # Launch Chromium with auto screen capture
-          $chromeArgs = @(
-            "--no-sandbox",
-            "--disable-gpu",
-            "--window-size=1920,1080",
-            "--start-maximized",
-            "--autoplay-policy=no-user-gesture-required",
-            "--auto-accept-camera-and-microphone-capture",
-            "--enable-features=DesktopCapture",
-            "--disable-features=site-per-process",
-            $screegoUrl
+          # Written line-by-line to avoid PowerShell here-string indentation issues
+          $launcherLines = @(
+            '`$app = "C:\cb-app"',
+            '`$tsIP = `$env:TAILSCALE_IP',
+            'if ([string]::IsNullOrWhiteSpace(`$tsIP)) {',
+            '  `$ipFile = "`$app\node-ip.txt"',
+            '  if (Test-Path `$ipFile) { `$tsIP = (Get-Content `$ipFile -Raw).Trim() }',
+            '}',
+            '`$screegoUrl = "http://`$tsIP`:5050"',
+            'Write-Host "Screego URL: `$screegoUrl"',
+            '',
+            '# Start Screego server (must use ''serve'' subcommand; config file is',
+            '# auto-discovered as screego.config in the same directory as the exe)',
+            'Start-Process "`$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -RedirectStandardOutput "`$app\screego-stdout.log" -RedirectStandardError "`$app\screego-stderr.log"',
+            'Start-Sleep -Seconds 5',
+            '',
+            '# Wait for Screego to be reachable',
+            '`$ready = `$false',
+            'for (`$i = 1; `$i -le 10; `$i++) {',
+            '  try {',
+            '    `$r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop',
+            '    if (`$r.StatusCode -eq 200) { `$ready = `$true; break }',
+            '  } catch { Start-Sleep -Seconds 2 }',
+            '}',
+            'if (-not `$ready) {',
+            '  Write-Warning "Screego not responding on 5050"',
+            '  if (Test-Path "`$app\screego-stderr.log") {',
+            '    Write-Host "=== Screego stderr ==="',
+            '    Get-Content "`$app\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
+            '  }',
+            '  if (Test-Path "`$app\screego-stdout.log") {',
+            '    Write-Host "=== Screego stdout ==="',
+            '    Get-Content "`$app\screego-stdout.log" | ForEach-Object { Write-Host `$_ }',
+            '  }',
+            '}',
+            '',
+            '# Launch Chromium with auto screen capture',
+            '`$chromeArgs = @(',
+            '  "--no-sandbox",',
+            '  "--disable-gpu",',
+            '  "--window-size=1920,1080",',
+            '  "--start-maximized",',
+            '  "--autoplay-policy=no-user-gesture-required",',
+            '  "--auto-accept-camera-and-microphone-capture",',
+            '  "--enable-features=DesktopCapture",',
+            '  "--disable-features=site-per-process",',
+            '  `$screegoUrl',
+            ')',
+            'Start-Process "C:\Program Files\chromium\Application\chrome.exe" -ArgumentList `$chromeArgs',
+            'Write-Host "Chromium launched with Screego at `$screegoUrl"'
           )
-          Start-Process "C:\Program Files\chromium\Application\chrome.exe" -ArgumentList $chromeArgs
-          Write-Host "Chromium launched with Screego at $screegoUrl"
-          '@
-          Set-Content -Path "$app\launch.ps1" -Value $launcher -Encoding UTF8
+          Set-Content -Path "$app\launch.ps1" -Value $launcherLines -Encoding UTF8
 
           # --- Download Screego Windows binary (with retry) ---
           $screegoUrls = @(
@@ -552,19 +551,19 @@ jobs:
                 if ($proc) { $proc | Stop-Process -Force }
                 Start-Sleep -Seconds 2
                 # Re-write config with latest IP (IP may have changed after mesh reconnect)
-                $newCfg = @"
-                SCREEGO_SECRET=${{ secrets.CLOUD_BROWSER_PASS }}
-                SCREEGO_EXTERNAL_IP=$tsIP
-                SCREEGO_SERVER_TLS=false
-                SCREEGO_SERVER_ADDRESS=0.0.0.0:5050
-                SCREEGO_TURN_ADDRESS=0.0.0.0:3478
-                SCREEGO_TURN_PORT_RANGE=50000:50100
-                SCREEGO_AUTH_MODE=none
-                SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false
-                SCREEGO_LOG_LEVEL=info
-                SCREEGO_SESSION_TIMEOUT_SECONDS=86400
-                "@
-                Set-Content -Path "C:\cb-app\screego.config" -Value $newCfg -Encoding UTF8
+                $cfgLines = @(
+                  "SCREEGO_SECRET=${{ secrets.CLOUD_BROWSER_PASS }}",
+                  "SCREEGO_EXTERNAL_IP=$tsIP",
+                  "SCREEGO_SERVER_TLS=false",
+                  "SCREEGO_SERVER_ADDRESS=0.0.0.0:5050",
+                  "SCREEGO_TURN_ADDRESS=0.0.0.0:3478",
+                  "SCREEGO_TURN_PORT_RANGE=50000:50100",
+                  "SCREEGO_AUTH_MODE=none",
+                  "SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false",
+                  "SCREEGO_LOG_LEVEL=info",
+                  "SCREEGO_SESSION_TIMEOUT_SECONDS=86400"
+                )
+                Set-Content -Path "C:\cb-app\screego.config" -Value $cfgLines -Encoding UTF8
                 Start-Process "C:\cb-app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden
                 Start-Sleep -Seconds 8
               }
