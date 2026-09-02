@@ -328,6 +328,8 @@ jobs:
           # fatal exit immediately. We set it to the Tailscale IP.
           # Using array-of-lines + Set-Content to avoid PowerShell here-string
           # indentation issues (closing "@ must be at column 0).
+          # IMPORTANT: Use -Encoding ASCII (NOT UTF8) — UTF8 adds a BOM that
+          # corrupts the first config line when godotenv parses it.
           $cfgLines = @(
             "SCREEGO_SECRET=$screegoPass",
             "SCREEGO_EXTERNAL_IP=$tsIP",
@@ -340,44 +342,80 @@ jobs:
             "SCREEGO_LOG_LEVEL=info",
             "SCREEGO_SESSION_TIMEOUT_SECONDS=86400"
           )
-          Set-Content -Path "$app\screego.config" -Value $cfgLines -Encoding UTF8
+          Set-Content -Path "$app\screego.config" -Value $cfgLines -Encoding ASCII
 
           # --- Chromium auto-screen-share launcher ---
           # Opens Screego web UI, auto-creates a room, auto-shares the desktop screen
           # Written line-by-line to avoid PowerShell here-string indentation issues
           $launcherLines = @(
-            '`$app = "C:\cb-app"',
+            '`$app = "C:\\cb-app"',
             '`$tsIP = `$env:SERVER_IP',
             'if ([string]::IsNullOrWhiteSpace(`$tsIP)) { `$tsIP = `$env:TAILSCALE_IP }',
             'if ([string]::IsNullOrWhiteSpace(`$tsIP)) {',
-            '  `$ipFile = "`$app\node-ip.txt"',
+            '  `$ipFile = "`$app\\node-ip.txt"',
             '  if (Test-Path `$ipFile) { `$tsIP = (Get-Content `$ipFile -Raw).Trim() }',
             '}',
             '`$screegoUrl = "http://`$tsIP`:5050"',
             'Write-Host "Screego URL: `$screegoUrl"',
             '',
-            '# Start Screego server (must use ''serve'' subcommand; config file is',
-            '# auto-discovered as screego.config in the same directory as the exe)',
-            'Start-Process "`$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -RedirectStandardOutput "`$app\screego-stdout.log" -RedirectStandardError "`$app\screego-stderr.log"',
-            'Start-Sleep -Seconds 5',
+            '# Remove old log files (Start-Process fails if they are locked)',
+            'Remove-Item "`$app\\screego-stdout.log" -ErrorAction SilentlyContinue',
+            'Remove-Item "`$app\\screego-stderr.log" -ErrorAction SilentlyContinue',
             '',
-            '# Wait for Screego to be reachable',
-            '`$ready = `$false',
-            'for (`$i = 1; `$i -le 10; `$i++) {',
+            '# Start Screego server with retry logic',
+            '# (must use ''serve'' subcommand; config file is auto-discovered as',
+            '# screego.config in the same directory as the exe)',
+            '`$screegoStarted = `$false',
+            'for (`$attempt = 1; `$attempt -le 3; `$attempt++) {',
+            '  Write-Host "Starting Screego (attempt `$attempt)..."',
             '  try {',
-            '    `$r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop',
-            '    if (`$r.StatusCode -eq 200) { `$ready = `$true; break }',
-            '  } catch { Start-Sleep -Seconds 2 }',
-            '}',
-            'if (-not `$ready) {',
-            '  Write-Warning "Screego not responding on 5050"',
-            '  if (Test-Path "`$app\screego-stderr.log") {',
-            '    Write-Host "=== Screego stderr ==="',
-            '    Get-Content "`$app\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
+            '    `$p = Start-Process "`$app\\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -PassThru -RedirectStandardOutput "`$app\\screego-stdout.log" -RedirectStandardError "`$app\\screego-stderr.log" -ErrorAction Stop',
+            '    Start-Sleep -Seconds 8',
+            '    if (-not `$p.HasExited) {',
+            '      Write-Host "Screego process is running (PID: `$(`$p.Id))"',
+            '      `$screegoStarted = `$true',
+            '      break',
+            '    } else {',
+            '      Write-Warning "Screego exited with code `$(`$p.ExitCode)"',
+            '      if (Test-Path "`$app\\screego-stderr.log") {',
+            '        Write-Host "=== Screego stderr ==="',
+            '        Get-Content "`$app\\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
+            '      }',
+            '      Start-Sleep -Seconds 3',
+            '    }',
+            '  } catch {',
+            '    Write-Warning "Start-Process failed: `$(`$_.Exception.Message)"',
+            '    Start-Sleep -Seconds 3',
             '  }',
-            '  if (Test-Path "`$app\screego-stdout.log") {',
-            '    Write-Host "=== Screego stdout ==="',
-            '    Get-Content "`$app\screego-stdout.log" | ForEach-Object { Write-Host `$_ }',
+            '}',
+            '',
+            '# Verify Screego is reachable on port 5050',
+            'if (`$screegoStarted) {',
+            '  `$ready = `$false',
+            '  for (`$i = 1; `$i -le 15; `$i++) {',
+            '    try {',
+            '      `$r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop',
+            '      if (`$r.StatusCode -eq 200) { `$ready = `$true; break }',
+            '    } catch { Start-Sleep -Seconds 3 }',
+            '  }',
+            '  if (`$ready) {',
+            '    Write-Host "Screego is ready on port 5050"',
+            '  } else {',
+            '    Write-Warning "Screego process running but port 5050 not responding"',
+            '    if (Test-Path "`$app\\screego-stderr.log") {',
+            '      Write-Host "=== Screego stderr ==="',
+            '      Get-Content "`$app\\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
+            '    }',
+            '    if (Test-Path "`$app\\screego-stdout.log") {',
+            '      Write-Host "=== Screego stdout ==="',
+            '      Get-Content "`$app\\screego-stdout.log" | ForEach-Object { Write-Host `$_ }',
+            '    }',
+            '  }',
+            '} else {',
+            '  Write-Warning "Screego failed to start after 3 attempts"',
+            '  if (Test-Path "`$app\\screego-stderr.log") {',
+            '    Write-Host "=== Screego stderr ==="',
+            '    Get-Content "`$app\\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
             '  }',
             '}',
             '',
@@ -393,7 +431,7 @@ jobs:
             '  "--disable-features=site-per-process",',
             '  `$screegoUrl',
             ')',
-            'Start-Process "C:\Program Files\chromium\Application\chrome.exe" -ArgumentList `$chromeArgs',
+            'Start-Process "C:\\Program Files\\chromium\\Application\\chrome.exe" -ArgumentList `$chromeArgs',
             'Write-Host "Chromium launched with Screego at `$screegoUrl"'
           )
           Set-Content -Path "$app\launch.ps1" -Value $launcherLines -Encoding UTF8
@@ -439,7 +477,7 @@ jobs:
           Start-Process powershell -ArgumentList "-NoProfile -File `"$app\api.ps1`"" -WindowStyle Hidden
           Start-Sleep -Seconds 2
           Start-Process powershell -ArgumentList "-NoProfile -File `"$app\launch.ps1`"" -WindowStyle Hidden
-          Start-Sleep -Seconds 12
+          Start-Sleep -Seconds 30
           Write-Host "Runtime started"
 
       ############################################################
@@ -573,9 +611,12 @@ jobs:
                   "SCREEGO_LOG_LEVEL=info",
                   "SCREEGO_SESSION_TIMEOUT_SECONDS=86400"
                 )
-                Set-Content -Path "C:\cb-app\screego.config" -Value $cfgLines -Encoding UTF8
-                Start-Process "C:\cb-app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden
-                Start-Sleep -Seconds 8
+                Set-Content -Path "C:\cb-app\screego.config" -Value $cfgLines -Encoding ASCII
+                # Remove old log files before restart
+                Remove-Item "C:\cb-app\screego-stdout.log" -ErrorAction SilentlyContinue
+                Remove-Item "C:\cb-app\screego-stderr.log" -ErrorAction SilentlyContinue
+                Start-Process "C:\cb-app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -RedirectStandardOutput "C:\cb-app\screego-stdout.log" -RedirectStandardError "C:\cb-app\screego-stderr.log"
+                Start-Sleep -Seconds 10
               }
 
               Start-Sleep -Seconds 300
