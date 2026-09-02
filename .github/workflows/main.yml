@@ -315,6 +315,30 @@ jobs:
             '    `$ctx.Response.ContentType = "application/json"',
             '    `$ctx.Response.ContentLength64 = `$bytes.Length',
             '    `$ctx.Response.OutputStream.Write(`$bytes, 0, `$bytes.Length)',
+            '  } elseif (`$ctx.Request.Url.AbsolutePath -eq ''/api/tunnel'') {',
+            '    # Return the Cloudflare tunnel URL for APK discovery',
+            '    `$tunnelUrl = "loading"',
+            '    if (Test-Path "C:\cb-app\tunnel-url.txt") {',
+            '      `$tunnelUrl = (Get-Content "C:\cb-app\tunnel-url.txt" -Raw).Trim()',
+            '    }',
+            '    `$json = ''{ "tunnel_url": "'' + `$tunnelUrl + ''" }''',
+            '    `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$json)',
+            '    `$ctx.Response.ContentType = "application/json"',
+            '    `$ctx.Response.Headers.Add("Access-Control-Allow-Origin","*")',
+            '    `$ctx.Response.ContentLength64 = `$bytes.Length',
+            '    `$ctx.Response.OutputStream.Write(`$bytes, 0, `$bytes.Length)',
+            '  } elseif (`$ctx.Request.Url.AbsolutePath -eq ''/'' -or `$ctx.Request.Url.AbsolutePath -eq ''/api/status'') {',
+            '    # Health check endpoint — returns server status + tunnel URL',
+            '    `$tunnelUrl = ""',
+            '    if (Test-Path "C:\cb-app\tunnel-url.txt") {',
+            '      `$tunnelUrl = (Get-Content "C:\cb-app\tunnel-url.txt" -Raw).Trim()',
+            '    }',
+            '    `$json = ''{ "status": "online", "tunnel_url": "'' + `$tunnelUrl + ''" }''',
+            '    `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$json)',
+            '    `$ctx.Response.ContentType = "application/json"',
+            '    `$ctx.Response.Headers.Add("Access-Control-Allow-Origin","*")',
+            '    `$ctx.Response.ContentLength64 = `$bytes.Length',
+            '    `$ctx.Response.OutputStream.Write(`$bytes, 0, `$bytes.Length)',
             '  } else {',
             '    `$ctx.Response.StatusCode = 404',
             '  }',
@@ -563,6 +587,152 @@ jobs:
           Write-Host "Chromium launched"
 
       ############################################################
+      # 6b) Cloudflare Quick Tunnel — expose port 5050 publicly
+      ############################################################
+      - name: Start Cloudflare Tunnel
+        shell: pwsh
+        run: |
+          $app = "C:\cb-app"
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Download cloudflared Windows binary
+          $cfUrls = @(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
+            "https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          )
+          $cfOk = $false
+          foreach ($cfUrl in $cfUrls) {
+            try {
+              Write-Host "Downloading cloudflared from $cfUrl..."
+              Invoke-WebRequest -Uri $cfUrl -OutFile "$app\cloudflared.exe" -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+              if ((Test-Path "$app\cloudflared.exe") -and (Get-Item "$app\cloudflared.exe").Length -gt 1MB) {
+                $cfOk = $true
+                Write-Host "cloudflared downloaded OK ($((Get-Item "$app\cloudflared.exe").Length) bytes)"
+                break
+              }
+            } catch {
+              Write-Host "Download failed: $($_.Exception.Message)"
+            }
+          }
+          if (-not $cfOk) { Write-Error "cloudflared download failed"; exit 1 }
+
+          # Start cloudflared quick tunnel for localhost:5050
+          # Output goes to a log file; we parse it to extract the trycloudflare.com URL
+          Remove-Item "$app\cloudflared.log" -ErrorAction SilentlyContinue
+          Start-Process "$app\cloudflared.exe" -ArgumentList @(
+            "tunnel", "--url", "http://localhost:5050",
+            "--logfile", "$app\cloudflared.log"
+          ) -WindowStyle Hidden
+          Write-Host "cloudflared started, waiting for tunnel URL..."
+
+          # Wait for tunnel URL to appear in log (up to 60 seconds)
+          $tunnelUrl = $null
+          for ($i = 1; $i -le 30; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path "$app\cloudflared.log") {
+              $logContent = Get-Content "$app\cloudflared.log" -Raw -ErrorAction SilentlyContinue
+              if ($logContent -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                $tunnelUrl = $Matches[1]
+                break
+              }
+            }
+          }
+
+          if (-not $tunnelUrl) {
+            Write-Error "Failed to get tunnel URL from cloudflared log"
+            if (Test-Path "$app\cloudflared.log") {
+              Write-Host "=== cloudflared log ==="
+              Get-Content "$app\cloudflared.log" | ForEach-Object { Write-Host $_ }
+            }
+            exit 1
+          }
+
+          Write-Host "============================================"
+          Write-Host "TUNNEL URL: $tunnelUrl"
+          Write-Host "============================================"
+
+          # Extract domain from URL (remove https://)
+          $tunnelDomain = $tunnelUrl -replace 'https://',''
+          Write-Host "Tunnel domain: $tunnelDomain"
+
+          # Save tunnel URL to file for other steps and the API
+          Set-Content -Path "$app\tunnel-url.txt" -Value $tunnelUrl -Encoding ASCII
+          Set-Content -Path "$app\tunnel-domain.txt" -Value $tunnelDomain -Encoding ASCII
+
+          # Export as GitHub env
+          "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
+          "TUNNEL_DOMAIN=$tunnelDomain" >> $env:GITHUB_ENV
+
+          # --- Rewrite Screego config with tunnel domain ---
+          # SCREEGO_EXTERNAL_IP can use dns: prefix to resolve a domain
+          $screegoPass = '${{ secrets.CLOUD_BROWSER_PASS }}'
+          $cfgLines = @(
+            "SCREEGO_SECRET=$screegoPass",
+            "SCREEGO_EXTERNAL_IP=dns:$tunnelDomain",
+            "SCREEGO_SERVER_TLS=false",
+            "SCREEGO_SERVER_ADDRESS=0.0.0.0:5050",
+            "SCREEGO_TURN_ADDRESS=0.0.0.0:3478",
+            "SCREEGO_TURN_PORT_RANGE=50000:50100",
+            "SCREEGO_AUTH_MODE=none",
+            "SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false",
+            "SCREEGO_LOG_LEVEL=info",
+            "SCREEGO_SESSION_TIMEOUT_SECONDS=86400",
+            "SCREEGO_TRUST_PROXY_HEADERS=true",
+            "SCREEGO_CORS_ALLOWED_ORIGINS=$tunnelUrl"
+          )
+          Set-Content -Path "$app\screego.config" -Value $cfgLines -Encoding ASCII
+          Write-Host "Screego config rewritten with tunnel domain"
+
+          # --- Restart Screego with new config ---
+          $proc = Get-Process -Name "screego" -ErrorAction SilentlyContinue
+          if ($proc) { $proc | Stop-Process -Force; Start-Sleep -Seconds 3 }
+          Remove-Item "$app\screego-stdout.log" -ErrorAction SilentlyContinue
+          Remove-Item "$app\screego-stderr.log" -ErrorAction SilentlyContinue
+          Start-Process "$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$app\screego-stdout.log" -RedirectStandardError "$app\screego-stderr.log"
+          Start-Sleep -Seconds 10
+
+          # Verify Screego restarted
+          try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            Write-Host "Screego restarted OK (status: $($r.StatusCode))"
+          } catch {
+            Write-Warning "Screego restart check failed: $($_.Exception.Message)"
+            if (Test-Path "$app\screego-stderr.log") {
+              Write-Host "=== Screego stderr ==="
+              Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
+            }
+          }
+
+          # --- Verify tunnel is accessible from outside ---
+          Start-Sleep -Seconds 5
+          try {
+            $r2 = Invoke-WebRequest -Uri "$tunnelUrl" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+            Write-Host "Tunnel accessible! Status: $($r2.StatusCode)"
+          } catch {
+            Write-Warning "Tunnel check failed (may need more time): $($_.Exception.Message)"
+          }
+
+          # --- Update Chromium to use tunnel URL ---
+          # Kill old Chromium and relaunch with tunnel URL
+          $chromeProcs = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
+          if ($chromeProcs) { $chromeProcs | Stop-Process -Force; Start-Sleep -Seconds 3 }
+          $chromePath = "C:\Program Files\chromium\Application\chrome.exe"
+          if (-not (Test-Path $chromePath)) { $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" }
+          $chromeArgs = @(
+            "--no-sandbox",
+            "--disable-gpu",
+            "--window-size=1920,1080",
+            "--start-maximized",
+            "--autoplay-policy=no-user-gesture-required",
+            "--auto-accept-camera-and-microphone-capture",
+            "--enable-features=DesktopCapture",
+            "--disable-features=site-per-process",
+            $tunnelUrl
+          )
+          Start-Process $chromePath -ArgumentList $chromeArgs
+          Write-Host "Chromium relaunched with tunnel URL: $tunnelUrl"
+
+      ############################################################
       # 7) Verify
       ############################################################
       - name: Verify Deployment
@@ -644,11 +814,23 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($tsIP)) {
             $tsIP = & $tsExe ip -4 2>$null
           }
+
+          # Read tunnel URL from file (set by Start Cloudflare Tunnel step)
+          $tunnelUrl = ""
+          $tunnelDomain = ""
+          if (Test-Path "C:\cb-app\tunnel-url.txt") {
+            $tunnelUrl = (Get-Content "C:\cb-app\tunnel-url.txt" -Raw).Trim()
+          }
+          if (Test-Path "C:\cb-app\tunnel-domain.txt") {
+            $tunnelDomain = (Get-Content "C:\cb-app\tunnel-domain.txt" -Raw).Trim()
+          }
+
           Write-Host "=== ACCESS INFO ==="
-          Write-Host "Web UI   : http://$tsIP`:5050"
-          Write-Host "SpeedAPI : http://$tsIP`:8080/api/speedtest"
-          Write-Host "Node     : $tsIP"
-          Write-Host "RDP Addr : $tsIP`:$p"
+          Write-Host "Tunnel URL : $tunnelUrl"
+          Write-Host "Web UI     : http://$tsIP`:5050"
+          Write-Host "SpeedAPI   : http://$tsIP`:8080/api/speedtest"
+          Write-Host "Node       : $tsIP"
+          Write-Host "RDP Addr   : $tsIP`:$p"
           Write-Host "===================="
 
           # Write IP to a file so other processes can read it
@@ -667,12 +849,20 @@ jobs:
                   if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = & $tsExe ip -4 2>$null }
                   if ($tsIP) { Set-Content -Path "C:\cb-app\node-ip.txt" -Value $tsIP -Encoding UTF8 }
               }
-              # Check Screego (5050) and RDP port
-              $aliveWeb = Test-NetConnection -ComputerName $tsIP -Port 5050 -WarningAction SilentlyContinue
-              $aliveRdp = Test-NetConnection -ComputerName $tsIP -Port $p -WarningAction SilentlyContinue
+
+              # Check Screego (5050), cloudflared, and tunnel accessibility
+              $aliveWeb = Test-NetConnection -ComputerName "127.0.0.1" -Port 5050 -WarningAction SilentlyContinue
+              $aliveCf = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
+              $tunnelAlive = $false
+              if ($tunnelUrl -and $tunnelUrl -ne "") {
+                try {
+                  $tr = Invoke-WebRequest -Uri $tunnelUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                  $tunnelAlive = ($tr.StatusCode -eq 200 -or $tr.StatusCode -eq 302)
+                } catch { $tunnelAlive = $false }
+              }
               $ts2 = Get-Date -Format 'HH:mm:ss'
               $elapsed = [math]::Round(((Get-Date) - $start).TotalMinutes)
-              Write-Host "[$ts2] web:$($aliveWeb.TcpTestSucceeded) rdp:$($aliveRdp.TcpTestSucceeded) | elapsed: ${elapsed}min | ip:$tsIP"
+              Write-Host "[$ts2] web:$($aliveWeb.TcpTestSucceeded) cf:$([bool]$aliveCf) tunnel:$tunnelAlive | elapsed: ${elapsed}min"
 
               # Restart Screego if it died
               if (-not $aliveWeb.TcpTestSucceeded) {
@@ -680,10 +870,11 @@ jobs:
                 $proc = Get-Process -Name "screego" -ErrorAction SilentlyContinue
                 if ($proc) { $proc | Stop-Process -Force }
                 Start-Sleep -Seconds 2
-                # Re-write config with latest IP (IP may have changed after mesh reconnect)
+                # Re-write config with tunnel domain (or Tailscale IP as fallback)
+                $extIp = if ($tunnelDomain) { "dns:$tunnelDomain" } else { $tsIP }
                 $cfgLines = @(
                   "SCREEGO_SECRET=${{ secrets.CLOUD_BROWSER_PASS }}",
-                  "SCREEGO_EXTERNAL_IP=$tsIP",
+                  "SCREEGO_EXTERNAL_IP=$extIp",
                   "SCREEGO_SERVER_TLS=false",
                   "SCREEGO_SERVER_ADDRESS=0.0.0.0:5050",
                   "SCREEGO_TURN_ADDRESS=0.0.0.0:3478",
@@ -691,14 +882,37 @@ jobs:
                   "SCREEGO_AUTH_MODE=none",
                   "SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false",
                   "SCREEGO_LOG_LEVEL=info",
-                  "SCREEGO_SESSION_TIMEOUT_SECONDS=86400"
+                  "SCREEGO_SESSION_TIMEOUT_SECONDS=86400",
+                  "SCREEGO_TRUST_PROXY_HEADERS=true"
                 )
+                if ($tunnelUrl) { $cfgLines += "SCREEGO_CORS_ALLOWED_ORIGINS=$tunnelUrl" }
                 Set-Content -Path "C:\cb-app\screego.config" -Value $cfgLines -Encoding ASCII
-                # Remove old log files before restart
                 Remove-Item "C:\cb-app\screego-stdout.log" -ErrorAction SilentlyContinue
                 Remove-Item "C:\cb-app\screego-stderr.log" -ErrorAction SilentlyContinue
                 Start-Process "C:\cb-app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -RedirectStandardOutput "C:\cb-app\screego-stdout.log" -RedirectStandardError "C:\cb-app\screego-stderr.log"
                 Start-Sleep -Seconds 10
+              }
+
+              # Restart cloudflared if it died
+              if (-not $aliveCf) {
+                Write-Warning "cloudflared down, restarting..."
+                Remove-Item "C:\cb-app\cloudflared.log" -ErrorAction SilentlyContinue
+                Start-Process "C:\cb-app\cloudflared.exe" -ArgumentList @(
+                  "tunnel", "--url", "http://localhost:5050",
+                  "--logfile", "C:\cb-app\cloudflared.log"
+                ) -WindowStyle Hidden
+                Start-Sleep -Seconds 15
+                # Check if we got a new tunnel URL
+                if (Test-Path "C:\cb-app\cloudflared.log") {
+                  $logContent = Get-Content "C:\cb-app\cloudflared.log" -Raw -ErrorAction SilentlyContinue
+                  if ($logContent -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+                    $tunnelUrl = $Matches[1]
+                    $tunnelDomain = $tunnelUrl -replace 'https://',''
+                    Set-Content -Path "C:\cb-app\tunnel-url.txt" -Value $tunnelUrl -Encoding ASCII
+                    Set-Content -Path "C:\cb-app\tunnel-domain.txt" -Value $tunnelDomain -Encoding ASCII
+                    Write-Host "New tunnel URL: $tunnelUrl"
+                  }
+                }
               }
 
               Start-Sleep -Seconds 300
