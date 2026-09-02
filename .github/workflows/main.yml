@@ -267,6 +267,7 @@ jobs:
           npm install --omit=dev --no-audit --no-fund
           Pop-Location
           $remoteToken = [guid]::NewGuid().ToString("N")
+          Write-Host "::add-mask::$remoteToken"
           "REMOTE_BROWSER_TOKEN=$remoteToken" >> $env:GITHUB_ENV
           Set-Content -Path "$app\remote-browser-token.txt" -Value $remoteToken -Encoding ASCII
 
@@ -606,7 +607,7 @@ jobs:
           $env:REMOTE_BROWSER_PORT = "5051"
           $env:CHROME_CDP_PORT = "9222"
           $env:REMOTE_BROWSER_TOKEN = (Get-Content "$app\remote-browser-token.txt" -Raw).Trim()
-          Start-Process "node.exe" -ArgumentList @("$app\remote-browser\server.js") -WorkingDirectory "$app\remote-browser" -WindowStyle Hidden -RedirectStandardOutput "$app\remote-browser.log" -RedirectStandardError "$app\remote-browser-error.log"
+          Start-Process "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$app\remote-browser\run.ps1") -WorkingDirectory "$app\remote-browser" -WindowStyle Hidden
           Start-Sleep -Seconds 5
           try {
             $rb = Invoke-WebRequest -Uri "http://127.0.0.1:5051/health?token=$env:REMOTE_BROWSER_TOKEN" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
@@ -809,11 +810,26 @@ jobs:
             Write-Warning "Screego port 5050 not reachable (legacy fallback only)"
           }
 
-          # Check the interactive browser control surface.
-          $chk3 = Test-NetConnection -ComputerName "127.0.0.1" -Port 5051 -WarningAction SilentlyContinue
-          if (-not $chk3.TcpTestSucceeded) { Write-Error "Interactive browser port 5051 check failed"; exit 1 }
-          $healthUrl = "http://127.0.0.1:5051/health?token=$((Get-Content 'C:\cb-app\remote-browser-token.txt' -Raw).Trim())"
-          $health = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+          # Check the interactive browser control surface over HTTP.
+          # Test-NetConnection can be flaky on hosted Windows runners, so use the
+          # actual authenticated endpoint that the phone will open.
+          $remoteToken = (Get-Content 'C:\cb-app\remote-browser-token.txt' -Raw).Trim()
+          $healthUrl = "http://127.0.0.1:5051/health?token=$remoteToken"
+          $remoteReady = $false
+          for ($i = 1; $i -le 15; $i++) {
+            try {
+              $health = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+              if ($health.StatusCode -eq 200) { $remoteReady = $true; break }
+            } catch { Start-Sleep -Seconds 2 }
+          }
+          if (-not $remoteReady) {
+            Write-Error "Interactive browser HTTP check failed"
+            Write-Host "=== remote-browser stderr ==="
+            Get-Content 'C:\cb-app\remote-browser-error.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            Write-Host "=== remote-browser server log ==="
+            Get-Content 'C:\cb-app\remote-browser\server.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
           Write-Host "Interactive browser port 5051 OK"
           Write-Host "Phone control URL is published in the workflow Summary."
 
