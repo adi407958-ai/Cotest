@@ -26,6 +26,7 @@ jobs:
     env:
       TS_HOSTNAME: cb-node
       SVC_PORT: ${{ secrets.CB_PORT }}
+      SERVER_IP: ${{ secrets.SERVER_IP }}
 
     steps:
       ############################################################
@@ -176,7 +177,7 @@ jobs:
           $connected = $false
           for ($attempt = 1; $attempt -le 5; $attempt++) {
             try {
-              $a = @('up', "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$env:TS_HOSTNAME", '--reset')
+              $a = @('up', "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$env:TS_HOSTNAME")
               if (-not [string]::IsNullOrWhiteSpace($tags)) { $a += "--advertise-tags=$tags" }
               & $tsExe @a 2>&1 | ForEach-Object { Write-Host $_ }
               $connected = $true
@@ -188,14 +189,18 @@ jobs:
           }
           if (-not $connected) { Write-Error "Mesh connect failed after 5 attempts"; exit 1 }
 
-          $tsIP = $null
-          $r = 0
-          while (-not $tsIP -and $r -lt 15) {
-              $tsIP = & $tsExe ip -4 2>$null
-              if (-not $tsIP) { Start-Sleep -Seconds 10 }
-              $r++
+          # Use the static SERVER_IP if configured; otherwise discover dynamically.
+          $tsIP = $env:SERVER_IP
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            $tsIP = $null
+            $r = 0
+            while (-not $tsIP -and $r -lt 15) {
+                $tsIP = & $tsExe ip -4 2>$null
+                if (-not $tsIP) { Start-Sleep -Seconds 10 }
+                $r++
+            }
           }
-          if (-not $tsIP) { Write-Error "Mesh IP failed"; exit 1 }
+          if (-not $tsIP) { Write-Error "Mesh IP failed" ; exit 1 }
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Mesh node online: $tsIP"
 
@@ -273,7 +278,8 @@ jobs:
           # --- Fetch Tailscale IP (needed for SCREEGO_EXTERNAL_IP) ---
           $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $tsExe)) { $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source }
-          $tsIP = $env:TAILSCALE_IP
+          $tsIP = $env:SERVER_IP
+          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
           if ([string]::IsNullOrWhiteSpace($tsIP) -and $tsExe) { $tsIP = & $tsExe ip -4 2>$null }
           if ([string]::IsNullOrWhiteSpace($tsIP)) {
             $ipFile = "$app\node-ip.txt"
@@ -341,7 +347,8 @@ jobs:
           # Written line-by-line to avoid PowerShell here-string indentation issues
           $launcherLines = @(
             '`$app = "C:\cb-app"',
-            '`$tsIP = `$env:TAILSCALE_IP',
+            '`$tsIP = `$env:SERVER_IP',
+            'if ([string]::IsNullOrWhiteSpace(`$tsIP)) { `$tsIP = `$env:TAILSCALE_IP }',
             'if ([string]::IsNullOrWhiteSpace(`$tsIP)) {',
             '  `$ipFile = "`$app\node-ip.txt"',
             '  if (Test-Path `$ipFile) { `$tsIP = (Get-Content `$ipFile -Raw).Trim() }',
@@ -445,7 +452,8 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $tsExe)) { $tsExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
-          $tsIP = $env:TAILSCALE_IP
+          $tsIP = $env:SERVER_IP
+          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
           if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = & $tsExe ip -4 2>$null }
           Write-Host "=== DEPLOYMENT INFO ==="
           Write-Host "Node IP     : $tsIP"
@@ -510,8 +518,9 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $tsExe)) { $tsExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
-          # Re-fetch IP in case env var didn't persist
-          $tsIP = $env:TAILSCALE_IP
+          # Use the static SERVER_IP if configured; otherwise fall back to env / discovery.
+          $tsIP = $env:SERVER_IP
+          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
           if ([string]::IsNullOrWhiteSpace($tsIP)) {
             $tsIP = & $tsExe ip -4 2>$null
           }
@@ -531,10 +540,11 @@ jobs:
               $ts = & $tsExe status 2>$null
               if ($ts -match "offline" -or $ts -match "stopped" -or [string]::IsNullOrWhiteSpace($ts)) {
                   Write-Warning "Mesh dropped, reconnecting..."
-                  & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TS_HOSTNAME --reset 2>&1 | ForEach-Object { Write-Host $_ }
+                  & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TS_HOSTNAME 2>&1 | ForEach-Object { Write-Host $_ }
                   Start-Sleep -Seconds 10
-                  # Re-fetch IP after reconnect
-                  $tsIP = & $tsExe ip -4 2>$null
+                  # Re-fetch IP after reconnect (prefer static SERVER_IP)
+                  $tsIP = $env:SERVER_IP
+                  if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = & $tsExe ip -4 2>$null }
                   if ($tsIP) { Set-Content -Path "C:\cb-app\node-ip.txt" -Value $tsIP -Encoding UTF8 }
               }
               # Check Screego (5050) and RDP port
