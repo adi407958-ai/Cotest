@@ -474,11 +474,93 @@ jobs:
       - name: Start Runtime
         run: |
           $app = "C:\cb-app"
+
+          # --- Start speedtest API listener (port 8080) ---
           Start-Process powershell -ArgumentList "-NoProfile -File `"$app\api.ps1`"" -WindowStyle Hidden
           Start-Sleep -Seconds 2
-          Start-Process powershell -ArgumentList "-NoProfile -File `"$app\launch.ps1`"" -WindowStyle Hidden
-          Start-Sleep -Seconds 30
-          Write-Host "Runtime started"
+
+          # --- Start Screego directly (visible in logs for debugging) ---
+          # Remove old log files first
+          Remove-Item "$app\screego-stdout.log" -ErrorAction SilentlyContinue
+          Remove-Item "$app\screego-stderr.log" -ErrorAction SilentlyContinue
+
+          $screegoStarted = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            Write-Host "Starting Screego (attempt $attempt)..."
+            try {
+              $proc = Start-Process "$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$app\screego-stdout.log" -RedirectStandardError "$app\screego-stderr.log" -ErrorAction Stop
+              Start-Sleep -Seconds 8
+              if (-not $proc.HasExited) {
+                Write-Host "Screego process running (PID: $($proc.Id))"
+                $screegoStarted = $true
+                break
+              } else {
+                Write-Warning "Screego exited with code $($proc.ExitCode)"
+                if (Test-Path "$app\screego-stderr.log") {
+                  Write-Host "=== Screego stderr ==="
+                  Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
+                }
+                if (Test-Path "$app\screego-stdout.log") {
+                  Write-Host "=== Screego stdout ==="
+                  Get-Content "$app\screego-stdout.log" | ForEach-Object { Write-Host $_ }
+                }
+                Remove-Item "$app\screego-stdout.log" -ErrorAction SilentlyContinue
+                Remove-Item "$app\screego-stderr.log" -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+              }
+            } catch {
+              Write-Warning "Start-Process failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds 3
+            }
+          }
+
+          if (-not $screegoStarted) {
+            Write-Error "Screego failed to start after 5 attempts"
+            # Don't exit — let the health check keep trying
+          }
+
+          # Verify port 5050 is listening
+          $portReady = $false
+          for ($i = 1; $i -le 15; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+              if ($r.StatusCode -eq 200 -or $r.StatusCode -eq 302) { $portReady = $true; break }
+            } catch { Start-Sleep -Seconds 3 }
+          }
+          if ($portReady) {
+            Write-Host "Screego is ready on port 5050"
+          } else {
+            Write-Warning "Screego port 5050 not responding yet (health check will retry)"
+            if (Test-Path "$app\screego-stderr.log") {
+              Write-Host "=== Screego stderr ==="
+              Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
+            }
+          }
+
+          # --- Launch Chromium with Screego screen share ---
+          $tsIP = $env:SERVER_IP
+          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            $ipFile = "$app\node-ip.txt"
+            if (Test-Path $ipFile) { $tsIP = (Get-Content $ipFile -Raw).Trim() }
+          }
+          $screegoUrl = "http://${tsIP}:5050"
+          Write-Host "Chromium will open: $screegoUrl"
+          $chromeArgs = @(
+            "--no-sandbox",
+            "--disable-gpu",
+            "--window-size=1920,1080",
+            "--start-maximized",
+            "--autoplay-policy=no-user-gesture-required",
+            "--auto-accept-camera-and-microphone-capture",
+            "--enable-features=DesktopCapture",
+            "--disable-features=site-per-process",
+            $screegoUrl
+          )
+          $chromePath = "C:\Program Files\chromium\Application\chrome.exe"
+          if (-not (Test-Path $chromePath)) { $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" }
+          Start-Process $chromePath -ArgumentList $chromeArgs
+          Write-Host "Chromium launched"
 
       ############################################################
       # 7) Verify
