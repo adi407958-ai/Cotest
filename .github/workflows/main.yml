@@ -572,13 +572,19 @@ jobs:
           Write-Host "Chromium will open: $screegoUrl"
           $chromeArgs = @(
             "--no-sandbox",
-            "--disable-gpu",
+            # Keep GPU acceleration enabled for smoother video playback on the VDS.
+            "--enable-gpu-rasterization",
+            "--enable-zero-copy",
+            "--ignore-gpu-blocklist",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
             "--window-size=1920,1080",
             "--start-maximized",
             "--autoplay-policy=no-user-gesture-required",
             "--auto-accept-camera-and-microphone-capture",
             "--enable-features=DesktopCapture",
-            "--disable-features=site-per-process",
+            "--disable-features=site-per-process,CalculateNativeWinOcclusion",
             $screegoUrl
           )
           $chromePath = "C:\Program Files\chromium\Application\chrome.exe"
@@ -737,13 +743,19 @@ jobs:
           if (-not (Test-Path $chromePath)) { $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" }
           $chromeArgs = @(
             "--no-sandbox",
-            "--disable-gpu",
+            # Keep GPU acceleration enabled for smoother video playback on the VDS.
+            "--enable-gpu-rasterization",
+            "--enable-zero-copy",
+            "--ignore-gpu-blocklist",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
             "--window-size=1920,1080",
             "--start-maximized",
             "--autoplay-policy=no-user-gesture-required",
             "--auto-accept-camera-and-microphone-capture",
             "--enable-features=DesktopCapture",
-            "--disable-features=site-per-process",
+            "--disable-features=site-per-process,CalculateNativeWinOcclusion",
             $tunnelUrl
           )
           Start-Process $chromePath -ArgumentList $chromeArgs
