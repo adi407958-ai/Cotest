@@ -713,3 +713,19 @@ jobs:
               Start-Sleep -Seconds 300
           }
           Write-Host "Health-check complete."
+
+      ############################################################
+      # 8) Build Android connector APK
+      ############################################################
+      - name: Build Android APK
+        shell: pwsh
+        run: |
+          if (-not (Get-Command gradle -ErrorAction SilentlyContinue)) { throw "Gradle is not available on this runner" }
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: cotest-connect-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
