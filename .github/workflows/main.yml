@@ -663,6 +663,23 @@ jobs:
           "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
           "TUNNEL_DOMAIN=$tunnelDomain" >> $env:GITHUB_ENV
 
+          # --- Publish a prominent clickable browser link in the GitHub Actions summary ---
+          # The summary is visible at the top of the workflow run, so the user can
+          # open the remote Chrome session without searching through raw log output.
+          $summaryLines = @(
+            "## Uzak Chrome tarayıcısı hazır",
+            "",
+            "[**Tarayıcıya bağlanmak için tıklayın**]($tunnelUrl)",
+            "",
+            "> Bağlantı Screego ekranını açar. Açılan sekmede uzak Windows makinesindeki Chrome ve sekme arayüzü görünür.",
+            "",
+            "**Oturum adresi:** $tunnelUrl",
+            "",
+            "Bu adres, geçici Cloudflare tüneli nedeniyle yeni çalışma başlatıldığında değişebilir."
+          )
+          $summaryLines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          Write-Host "::notice title=Uzak Chrome bağlantısı::$tunnelUrl"
+
           # --- Rewrite Screego config with tunnel domain ---
           # SCREEGO_EXTERNAL_IP can use dns: prefix to resolve a domain
           $screegoPass = '${{ secrets.CLOUD_BROWSER_PASS }}'
@@ -827,6 +844,7 @@ jobs:
 
           Write-Host "=== ACCESS INFO ==="
           Write-Host "Tunnel URL : $tunnelUrl"
+          Write-Host "Open in browser: $tunnelUrl"
           Write-Host "Web UI     : http://$tsIP`:5050"
           Write-Host "SpeedAPI   : http://$tsIP`:8080/api/speedtest"
           Write-Host "Node       : $tsIP"
@@ -910,6 +928,17 @@ jobs:
                     $tunnelDomain = $tunnelUrl -replace 'https://',''
                     Set-Content -Path "C:\cb-app\tunnel-url.txt" -Value $tunnelUrl -Encoding ASCII
                     Set-Content -Path "C:\cb-app\tunnel-domain.txt" -Value $tunnelDomain -Encoding ASCII
+                    $summaryLines = @(
+                      "## Uzak Chrome tarayıcısı hazır",
+                      "",
+                      "[**Yeni tarayıcı bağlantısını açmak için tıklayın**]($tunnelUrl)",
+                      "",
+                      "> Tünel yeniden başlatıldı; bu yeni adresi kullanın.",
+                      "",
+                      "**Oturum adresi:** $tunnelUrl"
+                    )
+                    $summaryLines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+                    Write-Host "::notice title=Yeni uzak Chrome bağlantısı::$tunnelUrl"
                     Write-Host "New tunnel URL: $tunnelUrl"
                   }
                 }
