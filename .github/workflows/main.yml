@@ -607,12 +607,16 @@ jobs:
           $env:REMOTE_BROWSER_PORT = "5051"
           $env:CHROME_CDP_PORT = "9222"
           $env:REMOTE_BROWSER_TOKEN = (Get-Content "$app\remote-browser-token.txt" -Raw).Trim()
-          Start-Process "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$app\remote-browser\run.ps1") -WorkingDirectory "$app\remote-browser" -WindowStyle Hidden
-          Start-Sleep -Seconds 5
+          $taskName = "CotestRemoteBrowser"
+          schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+          $taskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$app\remote-browser\run.ps1`""
+          schtasks.exe /Create /TN $taskName /SC ONSTART /RU SYSTEM /RL HIGHEST /TR $taskCommand /F | Out-Null
+          schtasks.exe /Run /TN $taskName | Out-Null
+          Start-Sleep -Seconds 8
           try {
             $rb = Invoke-WebRequest -Uri "http://127.0.0.1:5051/health?token=$env:REMOTE_BROWSER_TOKEN" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
             Write-Host "Interactive remote browser is ready on port 5051"
-          } catch { Write-Error "Remote browser failed to start: $($_.Exception.Message)"; Get-Content "$app\remote-browser-error.log" -ErrorAction SilentlyContinue }
+          } catch { Write-Error "Remote browser failed to start: $($_.Exception.Message)"; Get-Content "$app\remote-browser\server.log" -ErrorAction SilentlyContinue }
 
       ############################################################
       # 6b) Cloudflare Quick Tunnel — expose interactive browser port 5051 publicly
@@ -932,10 +936,7 @@ jobs:
               # Restart the interactive browser server if it died.
               if (-not $aliveRemote.TcpTestSucceeded) {
                 Write-Warning "Interactive browser down, restarting..."
-                $env:REMOTE_BROWSER_PORT = "5051"
-                $env:CHROME_CDP_PORT = "9222"
-                $env:REMOTE_BROWSER_TOKEN = (Get-Content "C:\cb-app\remote-browser-token.txt" -Raw).Trim()
-                Start-Process "node.exe" -ArgumentList @("C:\cb-app\remote-browser\server.js") -WorkingDirectory "C:\cb-app\remote-browser" -WindowStyle Hidden -RedirectStandardOutput "C:\cb-app\remote-browser.log" -RedirectStandardError "C:\cb-app\remote-browser-error.log"
+                schtasks.exe /Run /TN "CotestRemoteBrowser" | Out-Null
                 Start-Sleep -Seconds 8
               }
 
