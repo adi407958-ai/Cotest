@@ -29,6 +29,9 @@ jobs:
       SERVER_IP: ${{ secrets.SERVER_IP }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       ############################################################
       # 1) Core environment setup
       ############################################################
@@ -253,6 +256,19 @@ jobs:
         run: |
           $app = "C:\cb-app"
           New-Item -ItemType Directory -Path $app -Force | Out-Null
+
+          # --- Interactive browser control surface ---
+          # The phone connects to this page; all navigation, search, clicks,
+          # typing, tabs, and video playback happen inside the VDS Chrome.
+          $remoteBrowser = Join-Path $app "remote-browser"
+          Remove-Item $remoteBrowser -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE "remote-browser") -Destination $remoteBrowser -Recurse -Force
+          Push-Location $remoteBrowser
+          npm install --omit=dev --no-audit --no-fund
+          Pop-Location
+          $remoteToken = [guid]::NewGuid().ToString("N")
+          "REMOTE_BROWSER_TOKEN=$remoteToken" >> $env:GITHUB_ENV
+          Set-Content -Path "$app\remote-browser-token.txt" -Value $remoteToken -Encoding ASCII
 
           # --- Ad blocking hosts ---
           $hostsPath = "C:\Windows\System32\drivers\etc\hosts"
@@ -561,18 +577,13 @@ jobs:
             }
           }
 
-          # --- Launch Chromium with Screego screen share ---
-          $tsIP = $env:SERVER_IP
-          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-            $ipFile = "$app\node-ip.txt"
-            if (Test-Path $ipFile) { $tsIP = (Get-Content $ipFile -Raw).Trim() }
-          }
-          $screegoUrl = "http://${tsIP}:5050"
-          Write-Host "Chromium will open: $screegoUrl"
+          # --- Launch an interactive VDS Chrome session ---
+          # Chrome is controlled through CDP by the web surface on port 5051.
           $chromeArgs = @(
             "--no-sandbox",
-            # Keep GPU acceleration enabled for smoother video playback on the VDS.
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=9222",
+            "--user-data-dir=C:\cb-app\chrome-profile",
             "--enable-gpu-rasterization",
             "--enable-zero-copy",
             "--ignore-gpu-blocklist",
@@ -582,18 +593,28 @@ jobs:
             "--window-size=1920,1080",
             "--start-maximized",
             "--autoplay-policy=no-user-gesture-required",
-            "--auto-accept-camera-and-microphone-capture",
-            "--enable-features=DesktopCapture",
             "--disable-features=site-per-process,CalculateNativeWinOcclusion",
-            $screegoUrl
+            "https://www.google.com"
           )
           $chromePath = "C:\Program Files\chromium\Application\chrome.exe"
           if (-not (Test-Path $chromePath)) { $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" }
           Start-Process $chromePath -ArgumentList $chromeArgs
-          Write-Host "Chromium launched"
+          Write-Host "Interactive Chromium launched with CDP on 9222"
+          Start-Sleep -Seconds 8
+
+          # Start the browser-control web server after Chrome is ready.
+          $env:REMOTE_BROWSER_PORT = "5051"
+          $env:CHROME_CDP_PORT = "9222"
+          $env:REMOTE_BROWSER_TOKEN = (Get-Content "$app\remote-browser-token.txt" -Raw).Trim()
+          Start-Process "node.exe" -ArgumentList @("$app\remote-browser\server.js") -WorkingDirectory "$app\remote-browser" -WindowStyle Hidden -RedirectStandardOutput "$app\remote-browser.log" -RedirectStandardError "$app\remote-browser-error.log"
+          Start-Sleep -Seconds 5
+          try {
+            $rb = Invoke-WebRequest -Uri "http://127.0.0.1:5051/health?token=$env:REMOTE_BROWSER_TOKEN" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            Write-Host "Interactive remote browser is ready on port 5051"
+          } catch { Write-Error "Remote browser failed to start: $($_.Exception.Message)"; Get-Content "$app\remote-browser-error.log" -ErrorAction SilentlyContinue }
 
       ############################################################
-      # 6b) Cloudflare Quick Tunnel — expose port 5050 publicly
+      # 6b) Cloudflare Quick Tunnel — expose interactive browser port 5051 publicly
       ############################################################
       - name: Start Cloudflare Tunnel
         shell: pwsh
@@ -622,11 +643,11 @@ jobs:
           }
           if (-not $cfOk) { Write-Error "cloudflared download failed"; exit 1 }
 
-          # Start cloudflared quick tunnel for localhost:5050
+          # Start cloudflared quick tunnel for the interactive browser surface on localhost:5051
           # Output goes to a log file; we parse it to extract the trycloudflare.com URL
           Remove-Item "$app\cloudflared.log" -ErrorAction SilentlyContinue
           Start-Process "$app\cloudflared.exe" -ArgumentList @(
-            "tunnel", "--url", "http://localhost:5050",
+            "tunnel", "--url", "http://localhost:5051",
             "--logfile", "$app\cloudflared.log"
           ) -WindowStyle Hidden
           Write-Host "cloudflared started, waiting for tunnel URL..."
@@ -661,12 +682,16 @@ jobs:
           $tunnelDomain = $tunnelUrl -replace 'https://',''
           Write-Host "Tunnel domain: $tunnelDomain"
 
-          # Save tunnel URL to file for other steps and the API
+          # Save tunnel URL and create the authenticated interactive browser URL.
+          $remoteToken = (Get-Content "$app\remote-browser-token.txt" -Raw).Trim()
+          $browserUrl = "$tunnelUrl/?token=$remoteToken"
           Set-Content -Path "$app\tunnel-url.txt" -Value $tunnelUrl -Encoding ASCII
+          Set-Content -Path "$app\browser-url.txt" -Value $browserUrl -Encoding ASCII
           Set-Content -Path "$app\tunnel-domain.txt" -Value $tunnelDomain -Encoding ASCII
 
           # Export as GitHub env
           "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
+          "BROWSER_URL=$browserUrl" >> $env:GITHUB_ENV
           "TUNNEL_DOMAIN=$tunnelDomain" >> $env:GITHUB_ENV
 
           # --- Publish a prominent clickable browser link in the GitHub Actions summary ---
@@ -675,16 +700,16 @@ jobs:
           $summaryLines = @(
             "## Uzak Chrome tarayıcısı hazır",
             "",
-            "[**Tarayıcıya bağlanmak için tıklayın**]($tunnelUrl)",
+            "[**VDS tarayıcısını açmak için tıklayın**]($browserUrl)",
             "",
-            "> Bağlantı Screego ekranını açar. Açılan sekmede uzak Windows makinesindeki Chrome ve sekme arayüzü görünür.",
+            "> Bu bağlantı telefondan VDS Chrome’unu kontrol eder. Arama, site açma, yazma, tıklama, sekme değiştirme ve video oynatma VDS üzerinde gerçekleşir.",
             "",
-            "**Oturum adresi:** $tunnelUrl",
+            "**Etkileşimli tarayıcı adresi:** $browserUrl",
             "",
             "Bu adres, geçici Cloudflare tüneli nedeniyle yeni çalışma başlatıldığında değişebilir."
           )
           $summaryLines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          Write-Host "::notice title=Uzak Chrome bağlantısı::$tunnelUrl"
+          Write-Host "::notice title=VDS tarayıcı bağlantısı::$browserUrl"
 
           # --- Rewrite Screego config with tunnel domain ---
           # SCREEGO_EXTERNAL_IP can use dns: prefix to resolve a domain
@@ -729,37 +754,15 @@ jobs:
           # --- Verify tunnel is accessible from outside ---
           Start-Sleep -Seconds 5
           try {
-            $r2 = Invoke-WebRequest -Uri "$tunnelUrl" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
-            Write-Host "Tunnel accessible! Status: $($r2.StatusCode)"
+            $r2 = Invoke-WebRequest -Uri "$browserUrl" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+            Write-Host "Interactive browser tunnel accessible! Status: $($r2.StatusCode)"
           } catch {
             Write-Warning "Tunnel check failed (may need more time): $($_.Exception.Message)"
           }
 
-          # --- Update Chromium to use tunnel URL ---
-          # Kill old Chromium and relaunch with tunnel URL
-          $chromeProcs = Get-Process -Name "chrome" -ErrorAction SilentlyContinue
-          if ($chromeProcs) { $chromeProcs | Stop-Process -Force; Start-Sleep -Seconds 3 }
-          $chromePath = "C:\Program Files\chromium\Application\chrome.exe"
-          if (-not (Test-Path $chromePath)) { $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" }
-          $chromeArgs = @(
-            "--no-sandbox",
-            # Keep GPU acceleration enabled for smoother video playback on the VDS.
-            "--enable-gpu-rasterization",
-            "--enable-zero-copy",
-            "--ignore-gpu-blocklist",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
-            "--window-size=1920,1080",
-            "--start-maximized",
-            "--autoplay-policy=no-user-gesture-required",
-            "--auto-accept-camera-and-microphone-capture",
-            "--enable-features=DesktopCapture",
-            "--disable-features=site-per-process,CalculateNativeWinOcclusion",
-            $tunnelUrl
-          )
-          Start-Process $chromePath -ArgumentList $chromeArgs
-          Write-Host "Chromium relaunched with tunnel URL: $tunnelUrl"
+          # Keep the existing CDP-enabled Chrome process alive.
+          # The phone connects to the remote-browser page, not to Chrome itself.
+          Write-Host "Interactive VDS browser remains attached on port 9222"
 
       ############################################################
       # 7) Verify
@@ -776,6 +779,9 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = & $tsExe ip -4 2>$null }
           Write-Host "=== DEPLOYMENT INFO ==="
           Write-Host "Node IP     : $tsIP"
+          $browserUrl = ""
+          if (Test-Path "C:\cb-app\browser-url.txt") { $browserUrl = (Get-Content "C:\cb-app\browser-url.txt" -Raw).Trim() }
+          Write-Host "Interactive browser: $browserUrl"
           Write-Host "Web UI      : http://$tsIP`:5050"
           Write-Host "Speed API   : http://$tsIP`:8080/api/speedtest"
           Write-Host "RDP Address : $tsIP`:$p"
@@ -800,8 +806,16 @@ jobs:
           if ($chk2.TcpTestSucceeded) {
             Write-Host "Screego port 5050 OK"
           } else {
-            Write-Warning "Screego port 5050 not reachable (may still be starting)"
+            Write-Warning "Screego port 5050 not reachable (legacy fallback only)"
           }
+
+          # Check the interactive browser control surface.
+          $chk3 = Test-NetConnection -ComputerName "127.0.0.1" -Port 5051 -WarningAction SilentlyContinue
+          if (-not $chk3.TcpTestSucceeded) { Write-Error "Interactive browser port 5051 check failed"; exit 1 }
+          $healthUrl = "http://127.0.0.1:5051/health?token=$((Get-Content 'C:\cb-app\remote-browser-token.txt' -Raw).Trim())"
+          $health = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+          Write-Host "Interactive browser port 5051 OK"
+          Write-Host "Phone control URL is published in the workflow Summary."
 
       ############################################################
       # 8) Chain trigger (re-dispatch)
@@ -846,9 +860,13 @@ jobs:
 
           # Read tunnel URL from file (set by Start Cloudflare Tunnel step)
           $tunnelUrl = ""
+          $browserUrl = ""
           $tunnelDomain = ""
           if (Test-Path "C:\cb-app\tunnel-url.txt") {
             $tunnelUrl = (Get-Content "C:\cb-app\tunnel-url.txt" -Raw).Trim()
+          }
+          if (Test-Path "C:\cb-app\browser-url.txt") {
+            $browserUrl = (Get-Content "C:\cb-app\browser-url.txt" -Raw).Trim()
           }
           if (Test-Path "C:\cb-app\tunnel-domain.txt") {
             $tunnelDomain = (Get-Content "C:\cb-app\tunnel-domain.txt" -Raw).Trim()
@@ -856,7 +874,7 @@ jobs:
 
           Write-Host "=== ACCESS INFO ==="
           Write-Host "Tunnel URL : $tunnelUrl"
-          Write-Host "Open in browser: $tunnelUrl"
+          Write-Host "Interactive browser: $browserUrl"
           Write-Host "Web UI     : http://$tsIP`:5050"
           Write-Host "SpeedAPI   : http://$tsIP`:8080/api/speedtest"
           Write-Host "Node       : $tsIP"
@@ -880,21 +898,32 @@ jobs:
                   if ($tsIP) { Set-Content -Path "C:\cb-app\node-ip.txt" -Value $tsIP -Encoding UTF8 }
               }
 
-              # Check Screego (5050), cloudflared, and tunnel accessibility
+              # Check the interactive browser (5051), cloudflared, and tunnel accessibility.
+              $aliveRemote = Test-NetConnection -ComputerName "127.0.0.1" -Port 5051 -WarningAction SilentlyContinue
               $aliveWeb = Test-NetConnection -ComputerName "127.0.0.1" -Port 5050 -WarningAction SilentlyContinue
               $aliveCf = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
               $tunnelAlive = $false
-              if ($tunnelUrl -and $tunnelUrl -ne "") {
+              if ($browserUrl -and $browserUrl -ne "") {
                 try {
-                  $tr = Invoke-WebRequest -Uri $tunnelUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-                  $tunnelAlive = ($tr.StatusCode -eq 200 -or $tr.StatusCode -eq 302)
+                  $tr = Invoke-WebRequest -Uri $browserUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                  $tunnelAlive = ($tr.StatusCode -eq 200)
                 } catch { $tunnelAlive = $false }
               }
               $ts2 = Get-Date -Format 'HH:mm:ss'
               $elapsed = [math]::Round(((Get-Date) - $start).TotalMinutes)
-              Write-Host "[$ts2] web:$($aliveWeb.TcpTestSucceeded) cf:$([bool]$aliveCf) tunnel:$tunnelAlive | elapsed: ${elapsed}min"
+              Write-Host "[$ts2] remote:$($aliveRemote.TcpTestSucceeded) web:$($aliveWeb.TcpTestSucceeded) cf:$([bool]$aliveCf) tunnel:$tunnelAlive | elapsed: ${elapsed}min"
 
-              # Restart Screego if it died
+              # Restart the interactive browser server if it died.
+              if (-not $aliveRemote.TcpTestSucceeded) {
+                Write-Warning "Interactive browser down, restarting..."
+                $env:REMOTE_BROWSER_PORT = "5051"
+                $env:CHROME_CDP_PORT = "9222"
+                $env:REMOTE_BROWSER_TOKEN = (Get-Content "C:\cb-app\remote-browser-token.txt" -Raw).Trim()
+                Start-Process "node.exe" -ArgumentList @("C:\cb-app\remote-browser\server.js") -WorkingDirectory "C:\cb-app\remote-browser" -WindowStyle Hidden -RedirectStandardOutput "C:\cb-app\remote-browser.log" -RedirectStandardError "C:\cb-app\remote-browser-error.log"
+                Start-Sleep -Seconds 8
+              }
+
+              # Restart Screego if it died (legacy screen-sharing fallback).
               if (-not $aliveWeb.TcpTestSucceeded) {
                 Write-Warning "Screego down, restarting..."
                 $proc = Get-Process -Name "screego" -ErrorAction SilentlyContinue
@@ -928,7 +957,7 @@ jobs:
                 Write-Warning "cloudflared down, restarting..."
                 Remove-Item "C:\cb-app\cloudflared.log" -ErrorAction SilentlyContinue
                 Start-Process "C:\cb-app\cloudflared.exe" -ArgumentList @(
-                  "tunnel", "--url", "http://localhost:5050",
+                  "tunnel", "--url", "http://localhost:5051",
                   "--logfile", "C:\cb-app\cloudflared.log"
                 ) -WindowStyle Hidden
                 Start-Sleep -Seconds 15
@@ -938,20 +967,23 @@ jobs:
                   if ($logContent -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
                     $tunnelUrl = $Matches[1]
                     $tunnelDomain = $tunnelUrl -replace 'https://',''
+                    $remoteToken = (Get-Content "C:\cb-app\remote-browser-token.txt" -Raw).Trim()
+                    $browserUrl = "$tunnelUrl/?token=$remoteToken"
                     Set-Content -Path "C:\cb-app\tunnel-url.txt" -Value $tunnelUrl -Encoding ASCII
+                    Set-Content -Path "C:\cb-app\browser-url.txt" -Value $browserUrl -Encoding ASCII
                     Set-Content -Path "C:\cb-app\tunnel-domain.txt" -Value $tunnelDomain -Encoding ASCII
                     $summaryLines = @(
                       "## Uzak Chrome tarayıcısı hazır",
                       "",
-                      "[**Yeni tarayıcı bağlantısını açmak için tıklayın**]($tunnelUrl)",
+                      "[**Yeni VDS tarayıcı bağlantısını açmak için tıklayın**]($browserUrl)",
                       "",
-                      "> Tünel yeniden başlatıldı; bu yeni adresi kullanın.",
+                      "> Tünel yeniden başlatıldı; arama, tıklama, yazma ve video oynatma yine VDS Chrome üzerinde gerçekleşir.",
                       "",
-                      "**Oturum adresi:** $tunnelUrl"
+                      "**Etkileşimli tarayıcı adresi:** $browserUrl"
                     )
                     $summaryLines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-                    Write-Host "::notice title=Yeni uzak Chrome bağlantısı::$tunnelUrl"
-                    Write-Host "New tunnel URL: $tunnelUrl"
+                    Write-Host "::notice title=Yeni VDS tarayıcı bağlantısı::$browserUrl"
+                    Write-Host "New interactive browser URL: $browserUrl"
                   }
                 }
               }
