@@ -94,12 +94,12 @@ wss.on('connection', async ws => {
     client = await attachTarget(id);
     await client.Page.enable();
     await client.Runtime.enable();
-    await client.Emulation.setDeviceMetricsOverride({ width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
+    await client.Emulation.setDeviceMetricsOverride({ width: 1440, height: 810, deviceScaleFactor: 1, mobile: false });
     client.Page.screencastFrame(async event => {
-      send({ type: 'frame', image: event.data });
+      send({ type: 'frame', image: event.data, width: 1440, height: 810 });
       try { await client.Page.screencastFrameAck({ sessionId: event.sessionId }); } catch (_) {}
     });
-    await client.Page.startScreencast({ format: 'jpeg', quality: 65, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 });
+    await client.Page.startScreencast({ format: 'jpeg', quality: 82, maxWidth: 1440, maxHeight: 810, everyNthFrame: 1 });
     client.Page.loadEventFired(() => snapshot());
     timer = setInterval(snapshot, 2500);
     await snapshot();
