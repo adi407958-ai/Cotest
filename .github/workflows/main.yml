@@ -43,6 +43,12 @@ jobs:
           Set-ItemProperty -Path "$ws\$proto" -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path "$ws\$proto" -Name "SecurityLayer" -Value 0 -Force
 
+          # RDP always listens on 3389. If CB_PORT is customized, forward that
+          # external port to the real RDP listener so clients can use CB_PORT.
+          netsh interface portproxy delete v4tov4 listenport=$p listenaddress=0.0.0.0 2>$null
+          if ($p -ne "3389") {
+            netsh interface portproxy add v4tov4 listenport=$p listenaddress=0.0.0.0 connectport=3389 connectaddress=127.0.0.1
+          }
           netsh advfirewall firewall delete rule name="CB-Svc" 2>$null
           netsh advfirewall firewall add rule name="CB-Svc" dir=in action=allow protocol=TCP localport=$p
           netsh advfirewall firewall delete rule name="CB-API" 2>$null
@@ -179,7 +185,10 @@ jobs:
             try {
               $a = @('up', "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$env:TS_HOSTNAME")
               if (-not [string]::IsNullOrWhiteSpace($tags)) { $a += "--advertise-tags=$tags" }
-              & $tsExe @a 2>&1 | ForEach-Object { Write-Host $_ }
+              $output = & $tsExe @a 2>&1
+              $exitCode = $LASTEXITCODE
+              $output | ForEach-Object { Write-Host $_ }
+              if ($exitCode -ne 0) { throw "Tailscale exited with code $exitCode" }
               $connected = $true
               break
             } catch {
