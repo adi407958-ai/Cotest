@@ -1,1010 +1,113 @@
-name: CI Build & Test
+name: RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      restart_chain:
-        description: "Rebuild?"
-        required: false
-        default: "true"
-  schedule:
-    - cron: "0 */6 * * *"
-
-permissions:
-  actions: write
-  contents: read
-
-concurrency:
-  group: ci-build
-  cancel-in-progress: false
 
 jobs:
-  build:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 350
-
-    env:
-      TS_HOSTNAME: cb-node
-      SVC_PORT: ${{ secrets.CB_PORT }}
-      SERVER_IP: ${{ secrets.SERVER_IP }}
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      ############################################################
-      # 1) Core environment setup
-      ############################################################
-      - name: Setup Core Environment
+      - name: Configure Core RDP Settings
         run: |
-          $p = $env:SVC_PORT
-          if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
-          $base = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
-          $ws   = Join-Path $base 'WinStations'
-          $proto= "$([char]82)$([char]68)$([char]80)-$([char]84)$([char]99)$([char]112)"
-          Set-ItemProperty -Path $base -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path "$ws\$proto" -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path "$ws\$proto" -Name "SecurityLayer" -Value 0 -Force
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="CB-Svc" 2>$null
-          netsh advfirewall firewall add rule name="CB-Svc" dir=in action=allow protocol=TCP localport=$p
-          netsh advfirewall firewall delete rule name="CB-API" 2>$null
-          netsh advfirewall firewall add rule name="CB-API" dir=in action=allow protocol=TCP localport=8080
-          netsh advfirewall firewall delete rule name="CB-Web" 2>$null
-          netsh advfirewall firewall add rule name="CB-Web" dir=in action=allow protocol=TCP localport=5050
-          netsh advfirewall firewall delete rule name="CB-TURN-T" 2>$null
-          netsh advfirewall firewall add rule name="CB-TURN-T" dir=in action=allow protocol=TCP localport=3478
-          netsh advfirewall firewall delete rule name="CB-TURN-U" 2>$null
-          netsh advfirewall firewall add rule name="CB-TURN-U" dir=in action=allow protocol=UDP localport=3478
-          netsh advfirewall firewall delete rule name="CB-RTC-T" 2>$null
-          netsh advfirewall firewall add rule name="CB-RTC-T" dir=in action=allow protocol=TCP localport=50000-50100
-          netsh advfirewall firewall delete rule name="CB-RTC-U" 2>$null
-          netsh advfirewall firewall add rule name="CB-RTC-U" dir=in action=allow protocol=UDP localport=50000-50100
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      ############################################################
-      # 2) Build user
-      ############################################################
-      - name: Configure Build User
+      - name: Create RDP User with Secure Password
         run: |
+          Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
           }
-          $raw  = @()
-          $raw += $charSet.Upper   | Get-Random -Count 4
-          $raw += $charSet.Lower   | Get-Random -Count 4
-          $raw += $charSet.Number  | Get-Random -Count 4
-          $raw += $charSet.Special | Get-Random -Count 4
-          $pw = -join ($raw | Sort-Object { Get-Random })
-          $sp = ConvertTo-SecureString $pw -AsPlainText -Force
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-          $u = $env:CB_USER
-          if ([string]::IsNullOrWhiteSpace($u)) { $u = "ci" }
-          if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $u }
-          New-LocalUser -Name $u -Password $sp -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $u
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
-
-          "CB_PASS=$pw" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name $u)) { Write-Error "User setup failed"; exit 1 }
-          Write-Host "User ready: $u"
-        env:
-          CB_USER: ${{ secrets.CB_USER }}
-
-      ############################################################
-      # 3) Mesh network (Tailscale)
-      ############################################################
-      - name: Setup Mesh Network
-        shell: pwsh
+      - name: Install Tailscale
         run: |
-          # Flush DNS in case of stale cache
-          ipconfig /flushdns | Out-Null
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          $installerPath = "$env:TEMP\ts-installer.msi"
-          $downloaded = $false
-
-          # Multiple URLs in case one fails (CDN / DNS issues)
-          $urls = @(
-            "https://packages.tailscale.com/stable/tailscale-setup-latest.msi",
-            "https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi",
-            "https://download.tailscale.com/stable/tailscale-setup-latest.msi"
-          )
-
-          foreach ($url in $urls) {
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-              try {
-                Write-Host "Trying $url (attempt $attempt)..."
-                $ProgressPreference = 'SilentlyContinue'
-                Invoke-WebRequest -Uri $url -OutFile $installerPath -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
-                if ((Test-Path $installerPath) -and (Get-Item $installerPath).Length -gt 100KB) {
-                  Write-Host "Downloaded OK from $url ($(((Get-Item $installerPath).Length)/1MB) MB)"
-                  $downloaded = $true
-                  break
-                }
-              } catch {
-                Write-Host "Failed attempt $attempt : $($_.Exception.Message)"
-                Start-Sleep -Seconds 5
-                ipconfig /flushdns | Out-Null
-              }
-            }
-            if ($downloaded) { break }
-          }
-
-          # Fallback: choco install tailscale
-          if (-not $downloaded) {
-            Write-Host "Direct download failed, trying choco..."
-            choco install tailscale -y --no-progress 2>&1 | Out-Null
-            if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
-              $downloaded = $true
-              Write-Host "Choco install OK"
-            }
-          }
-
-          if (-not $downloaded) {
-            # Last resort: winget
-            Write-Host "Trying winget..."
-            winget install tailscale.1 --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-            if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
-              $downloaded = $true
-            }
-          }
-
-          if (-not $downloaded) { Write-Error "All download methods failed"; exit 1 }
-
-          # Install MSI if we downloaded it (choco/winget already installed)
-          if (Test-Path $installerPath) {
-            Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
-            Remove-Item $installerPath -Force
-          }
-          Start-Sleep -Seconds 5
-
-      - name: Connect Mesh Node
-        shell: pwsh
+      - name: Establish Tailscale Connection
         run: |
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tsExe)) {
-            # Sometimes installed to x86 path
-            $tsExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-          if (-not (Test-Path $tsExe)) {
-            Write-Error "tailscale.exe not found"; exit 1
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
-          Write-Host "Using: $tsExe"
-
-          $tags = "${{ secrets.CB_TAGS }}"
-          $connected = $false
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
-            try {
-              $a = @('up', "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=$env:TS_HOSTNAME")
-              if (-not [string]::IsNullOrWhiteSpace($tags)) { $a += "--advertise-tags=$tags" }
-              & $tsExe @a 2>&1 | ForEach-Object { Write-Host $_ }
-              $connected = $true
-              break
-            } catch {
-              Write-Host "Connect attempt $attempt failed: $($_.Exception.Message)"
-              Start-Sleep -Seconds 10
-            }
-          }
-          if (-not $connected) { Write-Error "Mesh connect failed after 5 attempts"; exit 1 }
-
-          # Use the static SERVER_IP if configured; otherwise discover dynamically.
-          $tsIP = $env:SERVER_IP
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-            $tsIP = $null
-            $r = 0
-            while (-not $tsIP -and $r -lt 15) {
-                $tsIP = & $tsExe ip -4 2>$null
-                if (-not $tsIP) { Start-Sleep -Seconds 10 }
-                $r++
-            }
-          }
-          if (-not $tsIP) { Write-Error "Mesh IP failed" ; exit 1 }
-          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Mesh node online: $tsIP"
-
-      ############################################################
-      # 4) Install build tools
-      ############################################################
-      - name: Install Build Tools
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
         run: |
-          choco feature enable -n=allowGlobalConfirmation
-          # Install packages one by one so one failure doesn't kill the build
-          choco install chromium -y --no-progress
-          choco install nodejs-lts -y --no-progress
-          choco install ffmpeg -y --no-progress
-          # speedtest-cli doesn't exist in choco anymore; install Ookla official CLI
-          $stPath = "C:\cb-app\speedtest.exe"
-          New-Item -ItemType Directory -Path "C:\cb-app" -Force | Out-Null
-          $stOk = $false
-          $stUrls = @(
-            "https://install.speedtest.net/app/cli/speedtest-cli.exe",
-            "https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-win64.zip"
-          )
-          foreach ($u in $stUrls) {
-            try {
-              $ProgressPreference = 'SilentlyContinue'
-              if ($u -match '\.zip$') {
-                $zip = "$env:TEMP\st.zip"
-                Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing -TimeoutSec 60
-                Expand-Archive -Path $zip -DestinationPath "C:\cb-app" -Force
-                Remove-Item $zip -Force
-              } else {
-                Invoke-WebRequest -Uri $u -OutFile $stPath -UseBasicParsing -TimeoutSec 60
-              }
-              $exe = Get-ChildItem "C:\cb-app" -Filter "speedtest*.exe" -Recurse | Select-Object -First 1
-              if ($exe) { $stOk = $true; Write-Host "Speedtest CLI installed: $($exe.FullName)"; break }
-            } catch { Write-Host "Speedtest download failed from $u : $($_.Exception.Message)" }
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
-          if (-not $stOk) {
-            Write-Host "Trying choco fallback for speedtest..."
-            choco install speedtest-by-ookla -y --no-progress 2>&1 | Out-Null
-          }
-          # Refresh PATH so node/npm are available
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
-          refreshenv 2>$null
-          Write-Host "Build tools installed"
+          Write-Host "TCP connectivity successful!"
 
-      ############################################################
-      # 5) Deploy app stack
-      ############################################################
-      - name: Deploy Application Stack
+      - name: Maintain Connection
         run: |
-          $app = "C:\cb-app"
-          New-Item -ItemType Directory -Path $app -Force | Out-Null
-
-          # --- Interactive browser control surface ---
-          # The phone connects to this page; all navigation, search, clicks,
-          # typing, tabs, and video playback happen inside the VDS Chrome.
-          $remoteBrowser = Join-Path $app "remote-browser"
-          Remove-Item $remoteBrowser -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE "remote-browser") -Destination $remoteBrowser -Recurse -Force
-          Push-Location $remoteBrowser
-          npm install --omit=dev --no-audit --no-fund
-          Pop-Location
-          $remoteToken = [guid]::NewGuid().ToString("N")
-          Write-Host "::add-mask::$remoteToken"
-          "REMOTE_BROWSER_TOKEN=$remoteToken" >> $env:GITHUB_ENV
-          Set-Content -Path "$app\remote-browser-token.txt" -Value $remoteToken -Encoding ASCII
-
-          # --- Ad blocking hosts ---
-          $hostsPath = "C:\Windows\System32\drivers\etc\hosts"
-          $ads = @(
-              "doubleclick.net","googlesyndication.com","googleadservices.com",
-              "googletagmanager.com","google-analytics.com","adservice.google.com",
-              "adservice.google.com.tr","amazon-adsystem.com","adnxs.com",
-              "criteo.com","scorecardresearch.com","ads.yahoo.com",
-              "ads.tiktok.com","ads.facebook.com","analytics.tiktok.com",
-              "pagead2.googlesyndication.com","ads.google.com","serving-sys.com",
-              "moatads.com","adsrvr.org"
-          )
-          $cur = Get-Content $hostsPath
-          foreach ($d in $ads) {
-              if ($cur -notmatch "0\.0\.0\.0\s+$d") {
-                  Add-Content $hostsPath "0.0.0.0 $d"
-              }
-          }
-
-          # --- Screego env ---
-          $screegoPass = '${{ secrets.CLOUD_BROWSER_PASS }}'
-
-          # --- Fetch Tailscale IP (needed for SCREEGO_EXTERNAL_IP) ---
-          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tsExe)) { $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source }
-          $tsIP = $env:SERVER_IP
-          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
-          if ([string]::IsNullOrWhiteSpace($tsIP) -and $tsExe) { $tsIP = & $tsExe ip -4 2>$null }
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-            $ipFile = "$app\node-ip.txt"
-            if (Test-Path $ipFile) { $tsIP = (Get-Content $ipFile -Raw).Trim() }
-          }
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-            Write-Warning "Could not determine Tailscale IP, using 127.0.0.1 as fallback"
-            $tsIP = "127.0.0.1"
-          }
-          Write-Host "Tailscale IP for Screego: $tsIP"
-
-          # --- speed-test API listener (port 8080) ---
-          # Written line-by-line to avoid PowerShell here-string indentation issues
-          $apiLines = @(
-            '`$listener = [System.Net.HttpListener]::new()',
-            '`$listener.Prefixes.Add("http://+:8080/")',
-            '`$listener.Start()',
-            '# Find speedtest exe',
-            '`$stExe = `$null',
-            '`$candidates = @("C:\cb-app\speedtest.exe","C:\cb-app\speedtest-cli.exe")',
-            'foreach (`$c in `$candidates) { if (Test-Path `$c) { `$stExe = `$c; break } }',
-            'if (-not `$stExe) {',
-            '  `$found = Get-ChildItem "C:\cb-app" -Filter "speedtest*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1',
-            '  if (`$found) { `$stExe = `$found.FullName }',
-            '}',
-            'if (-not `$stExe) { `$stExe = "speedtest" }',
-            'while (`$listener.IsListening) {',
-            '  `$ctx = `$listener.GetContext()',
-            '  if (`$ctx.Request.Url.AbsolutePath -eq ''/api/speedtest'') {',
-            '    `$r = & `$stExe --format=json --accept-license --accept-gdpr 2>`$null',
-            '    if (-not `$r) { `$r = ''{ "download": 0, "upload": 0, "ping": 0 }'' }',
-            '    `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$r)',
-            '    `$ctx.Response.ContentType = "application/json"',
-            '    `$ctx.Response.ContentLength64 = `$bytes.Length',
-            '    `$ctx.Response.OutputStream.Write(`$bytes, 0, `$bytes.Length)',
-            '  } elseif (`$ctx.Request.Url.AbsolutePath -eq ''/api/tunnel'') {',
-            '    # Return the Cloudflare tunnel URL for APK discovery',
-            '    `$tunnelUrl = "loading"',
-            '    if (Test-Path "C:\cb-app\tunnel-url.txt") {',
-            '      `$tunnelUrl = (Get-Content "C:\cb-app\tunnel-url.txt" -Raw).Trim()',
-            '    }',
-            '    `$json = ''{ "tunnel_url": "'' + `$tunnelUrl + ''" }''',
-            '    `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$json)',
-            '    `$ctx.Response.ContentType = "application/json"',
-            '    `$ctx.Response.Headers.Add("Access-Control-Allow-Origin","*")',
-            '    `$ctx.Response.ContentLength64 = `$bytes.Length',
-            '    `$ctx.Response.OutputStream.Write(`$bytes, 0, `$bytes.Length)',
-            '  } elseif (`$ctx.Request.Url.AbsolutePath -eq ''/'' -or `$ctx.Request.Url.AbsolutePath -eq ''/api/status'') {',
-            '    # Health check endpoint — returns server status + tunnel URL',
-            '    `$tunnelUrl = ""',
-            '    if (Test-Path "C:\cb-app\tunnel-url.txt") {',
-            '      `$tunnelUrl = (Get-Content "C:\cb-app\tunnel-url.txt" -Raw).Trim()',
-            '    }',
-            '    `$json = ''{ "status": "online", "tunnel_url": "'' + `$tunnelUrl + ''" }''',
-            '    `$bytes = [System.Text.Encoding]::UTF8.GetBytes(`$json)',
-            '    `$ctx.Response.ContentType = "application/json"',
-            '    `$ctx.Response.Headers.Add("Access-Control-Allow-Origin","*")',
-            '    `$ctx.Response.ContentLength64 = `$bytes.Length',
-            '    `$ctx.Response.OutputStream.Write(`$bytes, 0, `$bytes.Length)',
-            '  } else {',
-            '    `$ctx.Response.StatusCode = 404',
-            '  }',
-            '  `$ctx.Response.Close()',
-            '}'
-          )
-          Set-Content -Path "$app\api.ps1" -Value $apiLines -Encoding UTF8
-
-          # --- Screego config file ---
-          # NOTE: SCREEGO_EXTERNAL_IP is REQUIRED — without it Screego does a
-          # fatal exit immediately. We set it to the Tailscale IP.
-          # Using array-of-lines + Set-Content to avoid PowerShell here-string
-          # indentation issues (closing "@ must be at column 0).
-          # IMPORTANT: Use -Encoding ASCII (NOT UTF8) — UTF8 adds a BOM that
-          # corrupts the first config line when godotenv parses it.
-          $cfgLines = @(
-            "SCREEGO_SECRET=$screegoPass",
-            "SCREEGO_EXTERNAL_IP=$tsIP",
-            "SCREEGO_SERVER_TLS=false",
-            "SCREEGO_SERVER_ADDRESS=0.0.0.0:5050",
-            "SCREEGO_TURN_ADDRESS=0.0.0.0:3478",
-            "SCREEGO_TURN_PORT_RANGE=50000:50100",
-            "SCREEGO_AUTH_MODE=none",
-            "SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false",
-            "SCREEGO_LOG_LEVEL=info",
-            "SCREEGO_SESSION_TIMEOUT_SECONDS=86400"
-          )
-          Set-Content -Path "$app\screego.config" -Value $cfgLines -Encoding ASCII
-
-          # --- Chromium auto-screen-share launcher ---
-          # Opens Screego web UI, auto-creates a room, auto-shares the desktop screen
-          # Written line-by-line to avoid PowerShell here-string indentation issues
-          $launcherLines = @(
-            '`$app = "C:\\cb-app"',
-            '`$tsIP = `$env:SERVER_IP',
-            'if ([string]::IsNullOrWhiteSpace(`$tsIP)) { `$tsIP = `$env:TAILSCALE_IP }',
-            'if ([string]::IsNullOrWhiteSpace(`$tsIP)) {',
-            '  `$ipFile = "`$app\\node-ip.txt"',
-            '  if (Test-Path `$ipFile) { `$tsIP = (Get-Content `$ipFile -Raw).Trim() }',
-            '}',
-            '`$screegoUrl = "http://`$tsIP`:5050"',
-            'Write-Host "Screego URL: `$screegoUrl"',
-            '',
-            '# Remove old log files (Start-Process fails if they are locked)',
-            'Remove-Item "`$app\\screego-stdout.log" -ErrorAction SilentlyContinue',
-            'Remove-Item "`$app\\screego-stderr.log" -ErrorAction SilentlyContinue',
-            '',
-            '# Start Screego server with retry logic',
-            '# (must use ''serve'' subcommand; config file is auto-discovered as',
-            '# screego.config in the same directory as the exe)',
-            '`$screegoStarted = `$false',
-            'for (`$attempt = 1; `$attempt -le 3; `$attempt++) {',
-            '  Write-Host "Starting Screego (attempt `$attempt)..."',
-            '  try {',
-            '    `$p = Start-Process "`$app\\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -PassThru -RedirectStandardOutput "`$app\\screego-stdout.log" -RedirectStandardError "`$app\\screego-stderr.log" -ErrorAction Stop',
-            '    Start-Sleep -Seconds 8',
-            '    if (-not `$p.HasExited) {',
-            '      Write-Host "Screego process is running (PID: `$(`$p.Id))"',
-            '      `$screegoStarted = `$true',
-            '      break',
-            '    } else {',
-            '      Write-Warning "Screego exited with code `$(`$p.ExitCode)"',
-            '      if (Test-Path "`$app\\screego-stderr.log") {',
-            '        Write-Host "=== Screego stderr ==="',
-            '        Get-Content "`$app\\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
-            '      }',
-            '      Start-Sleep -Seconds 3',
-            '    }',
-            '  } catch {',
-            '    Write-Warning "Start-Process failed: `$(`$_.Exception.Message)"',
-            '    Start-Sleep -Seconds 3',
-            '  }',
-            '}',
-            '',
-            '# Verify Screego is reachable on port 5050',
-            'if (`$screegoStarted) {',
-            '  `$ready = `$false',
-            '  for (`$i = 1; `$i -le 15; `$i++) {',
-            '    try {',
-            '      `$r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop',
-            '      if (`$r.StatusCode -eq 200) { `$ready = `$true; break }',
-            '    } catch { Start-Sleep -Seconds 3 }',
-            '  }',
-            '  if (`$ready) {',
-            '    Write-Host "Screego is ready on port 5050"',
-            '  } else {',
-            '    Write-Warning "Screego process running but port 5050 not responding"',
-            '    if (Test-Path "`$app\\screego-stderr.log") {',
-            '      Write-Host "=== Screego stderr ==="',
-            '      Get-Content "`$app\\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
-            '    }',
-            '    if (Test-Path "`$app\\screego-stdout.log") {',
-            '      Write-Host "=== Screego stdout ==="',
-            '      Get-Content "`$app\\screego-stdout.log" | ForEach-Object { Write-Host `$_ }',
-            '    }',
-            '  }',
-            '} else {',
-            '  Write-Warning "Screego failed to start after 3 attempts"',
-            '  if (Test-Path "`$app\\screego-stderr.log") {',
-            '    Write-Host "=== Screego stderr ==="',
-            '    Get-Content "`$app\\screego-stderr.log" | ForEach-Object { Write-Host `$_ }',
-            '  }',
-            '}',
-            '',
-            '# Launch Chromium with auto screen capture',
-            '`$chromeArgs = @(',
-            '  "--no-sandbox",',
-            '  "--disable-gpu",',
-            '  "--window-size=1920,1080",',
-            '  "--start-maximized",',
-            '  "--autoplay-policy=no-user-gesture-required",',
-            '  "--auto-accept-camera-and-microphone-capture",',
-            '  "--enable-features=DesktopCapture",',
-            '  "--disable-features=site-per-process",',
-            '  `$screegoUrl',
-            ')',
-            'Start-Process "C:\\Program Files\\chromium\\Application\\chrome.exe" -ArgumentList `$chromeArgs',
-            'Write-Host "Chromium launched with Screego at `$screegoUrl"'
-          )
-          Set-Content -Path "$app\launch.ps1" -Value $launcherLines -Encoding UTF8
-
-          # --- Download Screego Windows binary (with retry) ---
-          $screegoUrls = @(
-            "https://github.com/screego/server/releases/download/v1.12.5/screego_1.12.5_windows_amd64.zip",
-            "https://gh-proxy.com/https://github.com/screego/server/releases/download/v1.12.5/screego_1.12.5_windows_amd64.zip"
-          )
-          $screegoOk = $false
-          $ProgressPreference = 'SilentlyContinue'
-          foreach ($sUrl in $screegoUrls) {
-            for ($sa = 1; $sa -le 3; $sa++) {
-              try {
-                Write-Host "Downloading Screego from $sUrl (attempt $sa)..."
-                Invoke-WebRequest -Uri $sUrl -OutFile "$app\screego.zip" -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-                if ((Test-Path "$app\screego.zip") -and (Get-Item "$app\screego.zip").Length -gt 1MB) {
-                  Expand-Archive -Path "$app\screego.zip" -DestinationPath $app -Force
-                  if (Test-Path "$app\screego.exe") {
-                    $screegoOk = $true
-                    Write-Host "Screego downloaded OK"
-                    break
-                  }
-                }
-              } catch {
-                Write-Host "Screego attempt $sa failed: $($_.Exception.Message)"
-                Start-Sleep -Seconds 5
-              }
-            }
-            if ($screegoOk) { break }
-          }
-          if (-not $screegoOk) { Write-Error "Screego download failed after all retries"; exit 1 }
-          Remove-Item "$app\screego.zip" -ErrorAction SilentlyContinue
-
-          Write-Host "App stack deployed to $app"
-
-      ############################################################
-      # 6) Start runtime
-      ############################################################
-      - name: Start Runtime
-        run: |
-          $app = "C:\cb-app"
-
-          # --- Start speedtest API listener (port 8080) ---
-          Start-Process powershell -ArgumentList "-NoProfile -File `"$app\api.ps1`"" -WindowStyle Hidden
-          Start-Sleep -Seconds 2
-
-          # --- Start Screego directly (visible in logs for debugging) ---
-          # Remove old log files first
-          Remove-Item "$app\screego-stdout.log" -ErrorAction SilentlyContinue
-          Remove-Item "$app\screego-stderr.log" -ErrorAction SilentlyContinue
-
-          $screegoStarted = $false
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
-            Write-Host "Starting Screego (attempt $attempt)..."
-            try {
-              $proc = Start-Process "$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$app\screego-stdout.log" -RedirectStandardError "$app\screego-stderr.log" -ErrorAction Stop
-              Start-Sleep -Seconds 8
-              if (-not $proc.HasExited) {
-                Write-Host "Screego process running (PID: $($proc.Id))"
-                $screegoStarted = $true
-                break
-              } else {
-                Write-Warning "Screego exited with code $($proc.ExitCode)"
-                if (Test-Path "$app\screego-stderr.log") {
-                  Write-Host "=== Screego stderr ==="
-                  Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
-                }
-                if (Test-Path "$app\screego-stdout.log") {
-                  Write-Host "=== Screego stdout ==="
-                  Get-Content "$app\screego-stdout.log" | ForEach-Object { Write-Host $_ }
-                }
-                Remove-Item "$app\screego-stdout.log" -ErrorAction SilentlyContinue
-                Remove-Item "$app\screego-stderr.log" -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 3
-              }
-            } catch {
-              Write-Warning "Start-Process failed: $($_.Exception.Message)"
-              Start-Sleep -Seconds 3
-            }
-          }
-
-          if (-not $screegoStarted) {
-            Write-Error "Screego failed to start after 5 attempts"
-            # Don't exit — let the health check keep trying
-          }
-
-          # Verify port 5050 is listening
-          $portReady = $false
-          for ($i = 1; $i -le 15; $i++) {
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-              if ($r.StatusCode -eq 200 -or $r.StatusCode -eq 302) { $portReady = $true; break }
-            } catch { Start-Sleep -Seconds 3 }
-          }
-          if ($portReady) {
-            Write-Host "Screego is ready on port 5050"
-          } else {
-            Write-Warning "Screego port 5050 not responding yet (health check will retry)"
-            if (Test-Path "$app\screego-stderr.log") {
-              Write-Host "=== Screego stderr ==="
-              Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
-            }
-          }
-
-          # --- Launch an interactive VDS Chrome session ---
-          # Chrome is controlled through CDP by the web surface on port 5051.
-          $chromeArgs = @(
-            "--no-sandbox",
-            "--remote-debugging-address=127.0.0.1",
-            "--remote-debugging-port=9222",
-            "--user-data-dir=C:\cb-app\chrome-profile",
-            "--enable-gpu-rasterization",
-            "--enable-zero-copy",
-            "--ignore-gpu-blocklist",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
-            "--window-size=1920,1080",
-            "--start-maximized",
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-features=site-per-process,CalculateNativeWinOcclusion",
-            "https://www.google.com"
-          )
-          $chromePath = "C:\Program Files\chromium\Application\chrome.exe"
-          if (-not (Test-Path $chromePath)) { $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" }
-          Start-Process $chromePath -ArgumentList $chromeArgs
-          Write-Host "Interactive Chromium launched with CDP on 9222"
-          Start-Sleep -Seconds 8
-
-          # Start the browser-control web server after Chrome is ready.
-          $env:REMOTE_BROWSER_PORT = "5051"
-          $env:CHROME_CDP_PORT = "9222"
-          $env:REMOTE_BROWSER_TOKEN = (Get-Content "$app\remote-browser-token.txt" -Raw).Trim()
-          $taskName = "CotestRemoteBrowser"
-          schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
-          $taskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$app\remote-browser\run.ps1`""
-          schtasks.exe /Create /TN $taskName /SC ONSTART /RU SYSTEM /RL HIGHEST /TR $taskCommand /F | Out-Null
-          schtasks.exe /Run /TN $taskName | Out-Null
-          Start-Sleep -Seconds 8
-          try {
-            $rb = Invoke-WebRequest -Uri "http://127.0.0.1:5051/health?token=$env:REMOTE_BROWSER_TOKEN" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-            Write-Host "Interactive remote browser is ready on port 5051"
-          } catch { Write-Error "Remote browser failed to start: $($_.Exception.Message)"; Get-Content "$app\remote-browser\server.log" -ErrorAction SilentlyContinue }
-
-      ############################################################
-      # 6b) Cloudflare Quick Tunnel — expose interactive browser port 5051 publicly
-      ############################################################
-      - name: Start Cloudflare Tunnel
-        shell: pwsh
-        run: |
-          $app = "C:\cb-app"
-          $ProgressPreference = 'SilentlyContinue'
-
-          # Download cloudflared Windows binary
-          $cfUrls = @(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
-            "https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          )
-          $cfOk = $false
-          foreach ($cfUrl in $cfUrls) {
-            try {
-              Write-Host "Downloading cloudflared from $cfUrl..."
-              Invoke-WebRequest -Uri $cfUrl -OutFile "$app\cloudflared.exe" -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-              if ((Test-Path "$app\cloudflared.exe") -and (Get-Item "$app\cloudflared.exe").Length -gt 1MB) {
-                $cfOk = $true
-                Write-Host "cloudflared downloaded OK ($((Get-Item "$app\cloudflared.exe").Length) bytes)"
-                break
-              }
-            } catch {
-              Write-Host "Download failed: $($_.Exception.Message)"
-            }
-          }
-          if (-not $cfOk) { Write-Error "cloudflared download failed"; exit 1 }
-
-          # Start cloudflared quick tunnel for the interactive browser surface on localhost:5051
-          # Output goes to a log file; we parse it to extract the trycloudflare.com URL
-          Remove-Item "$app\cloudflared.log" -ErrorAction SilentlyContinue
-          Start-Process "$app\cloudflared.exe" -ArgumentList @(
-            "tunnel", "--url", "http://localhost:5051",
-            "--logfile", "$app\cloudflared.log"
-          ) -WindowStyle Hidden
-          Write-Host "cloudflared started, waiting for tunnel URL..."
-
-          # Wait for tunnel URL to appear in log (up to 60 seconds)
-          $tunnelUrl = $null
-          for ($i = 1; $i -le 30; $i++) {
-            Start-Sleep -Seconds 2
-            if (Test-Path "$app\cloudflared.log") {
-              $logContent = Get-Content "$app\cloudflared.log" -Raw -ErrorAction SilentlyContinue
-              if ($logContent -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-                $tunnelUrl = $Matches[1]
-                break
-              }
-            }
-          }
-
-          if (-not $tunnelUrl) {
-            Write-Error "Failed to get tunnel URL from cloudflared log"
-            if (Test-Path "$app\cloudflared.log") {
-              Write-Host "=== cloudflared log ==="
-              Get-Content "$app\cloudflared.log" | ForEach-Object { Write-Host $_ }
-            }
-            exit 1
-          }
-
-          Write-Host "============================================"
-          Write-Host "TUNNEL URL: $tunnelUrl"
-          Write-Host "============================================"
-
-          # Extract domain from URL (remove https://)
-          $tunnelDomain = $tunnelUrl -replace 'https://',''
-          Write-Host "Tunnel domain: $tunnelDomain"
-
-          # Save tunnel URL and create the authenticated interactive browser URL.
-          $remoteToken = (Get-Content "$app\remote-browser-token.txt" -Raw).Trim()
-          $browserUrl = "$tunnelUrl/?token=$remoteToken"
-          Set-Content -Path "$app\tunnel-url.txt" -Value $tunnelUrl -Encoding ASCII
-          Set-Content -Path "$app\browser-url.txt" -Value $browserUrl -Encoding ASCII
-          Set-Content -Path "$app\tunnel-domain.txt" -Value $tunnelDomain -Encoding ASCII
-
-          # Export as GitHub env
-          "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
-          "BROWSER_URL=$browserUrl" >> $env:GITHUB_ENV
-          "TUNNEL_DOMAIN=$tunnelDomain" >> $env:GITHUB_ENV
-
-          # --- Publish a prominent clickable browser link in the GitHub Actions summary ---
-          # The summary is visible at the top of the workflow run, so the user can
-          # open the remote Chrome session without searching through raw log output.
-          $summaryLines = @(
-            "## Uzak Chrome tarayıcısı hazır",
-            "",
-            "[**VDS tarayıcısını açmak için tıklayın**]($browserUrl)",
-            "",
-            "> Bu bağlantı telefondan VDS Chrome’unu kontrol eder. Arama, site açma, yazma, tıklama, sekme değiştirme ve video oynatma VDS üzerinde gerçekleşir.",
-            "",
-            "**Etkileşimli tarayıcı adresi:** $browserUrl",
-            "",
-            "Bu adres, geçici Cloudflare tüneli nedeniyle yeni çalışma başlatıldığında değişebilir."
-          )
-          $summaryLines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          Write-Host "::notice title=VDS tarayıcı bağlantısı::$browserUrl"
-
-          # --- Rewrite Screego config with tunnel domain ---
-          # SCREEGO_EXTERNAL_IP can use dns: prefix to resolve a domain
-          $screegoPass = '${{ secrets.CLOUD_BROWSER_PASS }}'
-          $cfgLines = @(
-            "SCREEGO_SECRET=$screegoPass",
-            "SCREEGO_EXTERNAL_IP=dns:$tunnelDomain",
-            "SCREEGO_SERVER_TLS=false",
-            "SCREEGO_SERVER_ADDRESS=0.0.0.0:5050",
-            "SCREEGO_TURN_ADDRESS=0.0.0.0:3478",
-            "SCREEGO_TURN_PORT_RANGE=50000:50100",
-            "SCREEGO_AUTH_MODE=none",
-            "SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false",
-            "SCREEGO_LOG_LEVEL=info",
-            "SCREEGO_SESSION_TIMEOUT_SECONDS=86400",
-            "SCREEGO_TRUST_PROXY_HEADERS=true",
-            "SCREEGO_CORS_ALLOWED_ORIGINS=$tunnelUrl"
-          )
-          Set-Content -Path "$app\screego.config" -Value $cfgLines -Encoding ASCII
-          Write-Host "Screego config rewritten with tunnel domain"
-
-          # --- Restart Screego with new config ---
-          $proc = Get-Process -Name "screego" -ErrorAction SilentlyContinue
-          if ($proc) { $proc | Stop-Process -Force; Start-Sleep -Seconds 3 }
-          Remove-Item "$app\screego-stdout.log" -ErrorAction SilentlyContinue
-          Remove-Item "$app\screego-stderr.log" -ErrorAction SilentlyContinue
-          Start-Process "$app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$app\screego-stdout.log" -RedirectStandardError "$app\screego-stderr.log"
-          Start-Sleep -Seconds 10
-
-          # Verify Screego restarted
-          try {
-            $r = Invoke-WebRequest -Uri "http://127.0.0.1:5050" -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-            Write-Host "Screego restarted OK (status: $($r.StatusCode))"
-          } catch {
-            Write-Warning "Screego restart check failed: $($_.Exception.Message)"
-            if (Test-Path "$app\screego-stderr.log") {
-              Write-Host "=== Screego stderr ==="
-              Get-Content "$app\screego-stderr.log" | ForEach-Object { Write-Host $_ }
-            }
-          }
-
-          # --- Verify tunnel is accessible from outside ---
-          Start-Sleep -Seconds 5
-          try {
-            $r2 = Invoke-WebRequest -Uri "$browserUrl" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
-            Write-Host "Interactive browser tunnel accessible! Status: $($r2.StatusCode)"
-          } catch {
-            Write-Warning "Tunnel check failed (may need more time): $($_.Exception.Message)"
-          }
-
-          # Keep the existing CDP-enabled Chrome process alive.
-          # The phone connects to the remote-browser page, not to Chrome itself.
-          Write-Host "Interactive VDS browser remains attached on port 9222"
-
-      ############################################################
-      # 7) Verify
-      ############################################################
-      - name: Verify Deployment
-        shell: pwsh
-        run: |
-          $p = $env:SVC_PORT
-          if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tsExe)) { $tsExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
-          $tsIP = $env:SERVER_IP
-          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
-          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = & $tsExe ip -4 2>$null }
-          Write-Host "=== DEPLOYMENT INFO ==="
-          Write-Host "Node IP     : $tsIP"
-          $browserUrl = ""
-          if (Test-Path "C:\cb-app\browser-url.txt") { $browserUrl = (Get-Content "C:\cb-app\browser-url.txt" -Raw).Trim() }
-          Write-Host "Interactive browser: $browserUrl"
-          Write-Host "Web UI      : http://$tsIP`:5050"
-          Write-Host "Speed API   : http://$tsIP`:8080/api/speedtest"
-          Write-Host "RDP Address : $tsIP`:$p"
-          Write-Host "Hostname    : $env:TS_HOSTNAME"
-          Write-Host "======================="
-
-          # Save IP for other steps
-          Set-Content -Path "C:\cb-app\node-ip.txt" -Value $tsIP -Encoding UTF8
-
-          # Check RDP port
-          $chk = Test-NetConnection -ComputerName $tsIP -Port $p -WarningAction SilentlyContinue
-          if (-not $chk.TcpTestSucceeded) { Write-Error "RDP port check failed"; exit 1 }
-          Write-Host "RDP port OK"
-
-          # Check Screego web UI
-          $chk2 = Test-NetConnection -ComputerName $tsIP -Port 5050 -WarningAction SilentlyContinue
-          if (-not $chk2.TcpTestSucceeded) {
-            Write-Warning "Screego port 5050 not yet up, waiting..."
-            Start-Sleep -Seconds 10
-            $chk2 = Test-NetConnection -ComputerName $tsIP -Port 5050 -WarningAction SilentlyContinue
-          }
-          if ($chk2.TcpTestSucceeded) {
-            Write-Host "Screego port 5050 OK"
-          } else {
-            Write-Warning "Screego port 5050 not reachable (legacy fallback only)"
-          }
-
-          # Check the interactive browser control surface over HTTP.
-          # Test-NetConnection can be flaky on hosted Windows runners, so use the
-          # actual authenticated endpoint that the phone will open.
-          $remoteToken = (Get-Content 'C:\cb-app\remote-browser-token.txt' -Raw).Trim()
-          $healthUrl = "http://127.0.0.1:5051/health?token=$remoteToken"
-          $remoteReady = $false
-          for ($i = 1; $i -le 15; $i++) {
-            try {
-              $health = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-              if ($health.StatusCode -eq 200) { $remoteReady = $true; break }
-            } catch { Start-Sleep -Seconds 2 }
-          }
-          if (-not $remoteReady) {
-            Write-Error "Interactive browser HTTP check failed"
-            Write-Host "=== remote-browser stderr ==="
-            Get-Content 'C:\cb-app\remote-browser-error.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            Write-Host "=== remote-browser server log ==="
-            Get-Content 'C:\cb-app\remote-browser\server.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            exit 1
-          }
-          Write-Host "Interactive browser port 5051 OK"
-          Write-Host "Phone control URL is published in the workflow Summary."
-
-      ############################################################
-      # 8) Chain trigger (re-dispatch)
-      ############################################################
-      - name: Trigger Next Build
-        if: ${{ github.event.inputs.restart_chain != 'false' }}
-        shell: pwsh
-        run: |
-          $token = "${{ secrets.GH_PAT }}"
-          if ([string]::IsNullOrWhiteSpace($token)) { $token = "${{ secrets.GITHUB_TOKEN }}" }
-          if ([string]::IsNullOrWhiteSpace($token)) { Write-Warning "No token, skip."; exit 0 }
-
-          $repo = "$env:GITHUB_REPOSITORY"
-          $wfId = "${{ github.workflow_id }}"
-          $body = @{ ref = "$env:GITHUB_REF"; inputs = @{ restart_chain = "true" } } | ConvertTo-Json
-          try {
-              Invoke-RestMethod -Method Post `
-                -Uri "https://api.github.com/repos/$repo/actions/workflows/$wfId/dispatches" `
-                -Headers @{ Authorization = "Bearer $token"; Accept="application/vnd.github+json" } `
-                -Body $body -ContentType "application/json"
-              Write-Host "Next build dispatched."
-          } catch {
-              Write-Warning "Dispatch failed: $_ . Cron still active."
-          }
-
-      ############################################################
-      # 9) Health-check loop
-      ############################################################
-      - name: Runtime Health Check
-        shell: pwsh
-        run: |
-          $p = $env:SVC_PORT
-          if ([string]::IsNullOrWhiteSpace($p)) { $p = "3389" }
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tsExe)) { $tsExe = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
-          # Use the static SERVER_IP if configured; otherwise fall back to env / discovery.
-          $tsIP = $env:SERVER_IP
-          if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = $env:TAILSCALE_IP }
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-            $tsIP = & $tsExe ip -4 2>$null
-          }
-
-          # Read tunnel URL from file (set by Start Cloudflare Tunnel step)
-          $tunnelUrl = ""
-          $browserUrl = ""
-          $tunnelDomain = ""
-          if (Test-Path "C:\cb-app\tunnel-url.txt") {
-            $tunnelUrl = (Get-Content "C:\cb-app\tunnel-url.txt" -Raw).Trim()
-          }
-          if (Test-Path "C:\cb-app\browser-url.txt") {
-            $browserUrl = (Get-Content "C:\cb-app\browser-url.txt" -Raw).Trim()
-          }
-          if (Test-Path "C:\cb-app\tunnel-domain.txt") {
-            $tunnelDomain = (Get-Content "C:\cb-app\tunnel-domain.txt" -Raw).Trim()
-          }
-
-          Write-Host "=== ACCESS INFO ==="
-          Write-Host "Tunnel URL : $tunnelUrl"
-          Write-Host "Interactive browser: $browserUrl"
-          Write-Host "Web UI     : http://$tsIP`:5050"
-          Write-Host "SpeedAPI   : http://$tsIP`:8080/api/speedtest"
-          Write-Host "Node       : $tsIP"
-          Write-Host "RDP Addr   : $tsIP`:$p"
-          Write-Host "===================="
-
-          # Write IP to a file so other processes can read it
-          Set-Content -Path "C:\cb-app\node-ip.txt" -Value $tsIP -Encoding UTF8
-
-          $start = Get-Date
-          $keepAlive = (New-TimeSpan -Hours 5 -Minutes 40).TotalSeconds
-          while (((Get-Date) - $start).TotalSeconds -lt $keepAlive) {
-              $ts = & $tsExe status 2>$null
-              if ($ts -match "offline" -or $ts -match "stopped" -or [string]::IsNullOrWhiteSpace($ts)) {
-                  Write-Warning "Mesh dropped, reconnecting..."
-                  & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$env:TS_HOSTNAME 2>&1 | ForEach-Object { Write-Host $_ }
-                  Start-Sleep -Seconds 10
-                  # Re-fetch IP after reconnect (prefer static SERVER_IP)
-                  $tsIP = $env:SERVER_IP
-                  if ([string]::IsNullOrWhiteSpace($tsIP)) { $tsIP = & $tsExe ip -4 2>$null }
-                  if ($tsIP) { Set-Content -Path "C:\cb-app\node-ip.txt" -Value $tsIP -Encoding UTF8 }
-              }
-
-              # Check the interactive browser (5051), cloudflared, and tunnel accessibility.
-              $aliveRemote = Test-NetConnection -ComputerName "127.0.0.1" -Port 5051 -WarningAction SilentlyContinue
-              $aliveWeb = Test-NetConnection -ComputerName "127.0.0.1" -Port 5050 -WarningAction SilentlyContinue
-              $aliveCf = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
-              $tunnelAlive = $false
-              if ($browserUrl -and $browserUrl -ne "") {
-                try {
-                  $tr = Invoke-WebRequest -Uri $browserUrl -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-                  $tunnelAlive = ($tr.StatusCode -eq 200)
-                } catch { $tunnelAlive = $false }
-              }
-              $ts2 = Get-Date -Format 'HH:mm:ss'
-              $elapsed = [math]::Round(((Get-Date) - $start).TotalMinutes)
-              Write-Host "[$ts2] remote:$($aliveRemote.TcpTestSucceeded) web:$($aliveWeb.TcpTestSucceeded) cf:$([bool]$aliveCf) tunnel:$tunnelAlive | elapsed: ${elapsed}min"
-
-              # Restart the interactive browser server if it died.
-              if (-not $aliveRemote.TcpTestSucceeded) {
-                Write-Warning "Interactive browser down, restarting..."
-                schtasks.exe /Run /TN "CotestRemoteBrowser" | Out-Null
-                Start-Sleep -Seconds 8
-              }
-
-              # Restart Screego if it died (legacy screen-sharing fallback).
-              if (-not $aliveWeb.TcpTestSucceeded) {
-                Write-Warning "Screego down, restarting..."
-                $proc = Get-Process -Name "screego" -ErrorAction SilentlyContinue
-                if ($proc) { $proc | Stop-Process -Force }
-                Start-Sleep -Seconds 2
-                # Re-write config with tunnel domain (or Tailscale IP as fallback)
-                $extIp = if ($tunnelDomain) { "dns:$tunnelDomain" } else { $tsIP }
-                $cfgLines = @(
-                  "SCREEGO_SECRET=${{ secrets.CLOUD_BROWSER_PASS }}",
-                  "SCREEGO_EXTERNAL_IP=$extIp",
-                  "SCREEGO_SERVER_TLS=false",
-                  "SCREEGO_SERVER_ADDRESS=0.0.0.0:5050",
-                  "SCREEGO_TURN_ADDRESS=0.0.0.0:3478",
-                  "SCREEGO_TURN_PORT_RANGE=50000:50100",
-                  "SCREEGO_AUTH_MODE=none",
-                  "SCREEGO_CLOSE_ROOM_WHEN_OWNER_LEAVES=false",
-                  "SCREEGO_LOG_LEVEL=info",
-                  "SCREEGO_SESSION_TIMEOUT_SECONDS=86400",
-                  "SCREEGO_TRUST_PROXY_HEADERS=true"
-                )
-                if ($tunnelUrl) { $cfgLines += "SCREEGO_CORS_ALLOWED_ORIGINS=$tunnelUrl" }
-                Set-Content -Path "C:\cb-app\screego.config" -Value $cfgLines -Encoding ASCII
-                Remove-Item "C:\cb-app\screego-stdout.log" -ErrorAction SilentlyContinue
-                Remove-Item "C:\cb-app\screego-stderr.log" -ErrorAction SilentlyContinue
-                Start-Process "C:\cb-app\screego.exe" -ArgumentList "serve" -WindowStyle Hidden -RedirectStandardOutput "C:\cb-app\screego-stdout.log" -RedirectStandardError "C:\cb-app\screego-stderr.log"
-                Start-Sleep -Seconds 10
-              }
-
-              # Restart cloudflared if it died
-              if (-not $aliveCf) {
-                Write-Warning "cloudflared down, restarting..."
-                Remove-Item "C:\cb-app\cloudflared.log" -ErrorAction SilentlyContinue
-                Start-Process "C:\cb-app\cloudflared.exe" -ArgumentList @(
-                  "tunnel", "--url", "http://localhost:5051",
-                  "--logfile", "C:\cb-app\cloudflared.log"
-                ) -WindowStyle Hidden
-                Start-Sleep -Seconds 15
-                # Check if we got a new tunnel URL
-                if (Test-Path "C:\cb-app\cloudflared.log") {
-                  $logContent = Get-Content "C:\cb-app\cloudflared.log" -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
-                    $tunnelUrl = $Matches[1]
-                    $tunnelDomain = $tunnelUrl -replace 'https://',''
-                    $remoteToken = (Get-Content "C:\cb-app\remote-browser-token.txt" -Raw).Trim()
-                    $browserUrl = "$tunnelUrl/?token=$remoteToken"
-                    Set-Content -Path "C:\cb-app\tunnel-url.txt" -Value $tunnelUrl -Encoding ASCII
-                    Set-Content -Path "C:\cb-app\browser-url.txt" -Value $browserUrl -Encoding ASCII
-                    Set-Content -Path "C:\cb-app\tunnel-domain.txt" -Value $tunnelDomain -Encoding ASCII
-                    $summaryLines = @(
-                      "## Uzak Chrome tarayıcısı hazır",
-                      "",
-                      "[**Yeni VDS tarayıcı bağlantısını açmak için tıklayın**]($browserUrl)",
-                      "",
-                      "> Tünel yeniden başlatıldı; arama, tıklama, yazma ve video oynatma yine VDS Chrome üzerinde gerçekleşir.",
-                      "",
-                      "**Etkileşimli tarayıcı adresi:** $browserUrl"
-                    )
-                    $summaryLines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-                    Write-Host "::notice title=Yeni VDS tarayıcı bağlantısı::$browserUrl"
-                    Write-Host "New interactive browser URL: $browserUrl"
-                  }
-                }
-              }
-
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
-          Write-Host "Health-check complete."
